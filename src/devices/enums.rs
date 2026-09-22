@@ -22,6 +22,9 @@ pub struct DeviceData {
     /// when the device reports a different state.
     #[serde(default)]
     pub volume_swipe: Option<bool>,
+    /// Listen with one pod: playback only pauses once no pod is in an ear.
+    #[serde(default)]
+    pub single_pod: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -11,6 +11,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub enum DeviceCommand {
     ControlCommand(ControlCommandIdentifiers, Vec<u8>),
     Rename(String),
+    /// A daemon setting rather than an AirPods one: see `DeviceData::single_pod`.
+    SetSinglePod(bool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +23,13 @@ pub enum AppEvent {
         product_id: u16,
     },
     DeviceDisconnected(String),
+    /// A known device seen only through its proximity broadcasts: nearby,
+    /// but not connected to this host.
+    DeviceNearby {
+        mac: String,
+        name: String,
+        product_id: u16,
+    },
     AACPEvent(String, Box<crate::bluetooth::aacp::AACPEvent>),
     AudioUnavailable,
 }
@@ -47,6 +56,12 @@ impl FocusedSection {
 #[derive(Debug, Clone, Default)]
 pub struct AirPodsDeviceState {
     pub name: String,
+    /// Holds a control session with this host. False for a device known only
+    /// from its proximity broadcasts.
+    pub connected: bool,
+    pub case_lid: Option<crate::bluetooth::aacp::LidState>,
+    /// Use one pod at a time; `None` until the daemon reports it.
+    pub single_pod: Option<bool>,
     pub model: Option<String>,
     pub serial_number: Option<String>,
     pub battery_left: Option<(u8, BatteryStatus)>,
@@ -105,6 +120,21 @@ impl AirPodsDeviceState {
             has_anc: true,
             ..Default::default()
         }
+    }
+
+    /// Model details for a device seen only through its broadcasts. Nothing
+    /// can be controlled without a session, so no noise-control section.
+    fn set_nearby_model(&mut self, product_id: u16) {
+        if product_id != 0 {
+            self.product_id = product_id;
+            self.model = Some(
+                crate::devices::apple_models::model_info(product_id)
+                    .name
+                    .to_string(),
+            );
+        }
+        self.has_anc = false;
+        self.has_adaptive = false;
     }
 }
 
@@ -196,17 +226,19 @@ impl App {
         let info = crate::devices::apple_models::model_info(s.product_id);
         let mut items = Vec::new();
 
-        // Noise control behavior
+        // Grouped and worded to match Apple's own AirPods settings panel, so a
+        // row here is findable by whatever it is called on the phone.
+        let mut audio = Vec::new();
         if s.has_anc {
             if info.has_conversation_awareness {
-                items.push(SettingsItem::Toggle {
+                audio.push(SettingsItem::Toggle {
                     label: "Conversation Awareness",
                     value: s.conversation_awareness,
                     cmd: ControlCommandIdentifiers::ConversationDetectConfig,
                 });
             }
             if s.has_adaptive && s.listening_mode == AirPodsNoiseControlMode::Adaptive {
-                items.push(SettingsItem::Slider {
+                audio.push(SettingsItem::Slider {
                     label: "Adaptive Noise Level",
                     value: s.adaptive_noise_level.unwrap_or(50),
                     min: 0,
@@ -214,33 +246,87 @@ impl App {
                     cmd: ControlCommandIdentifiers::AutoAncStrength,
                 });
             }
-            items.push(SettingsItem::Toggle {
-                label: "NC with One AirPod",
-                value: s.one_bud_anc,
-                cmd: ControlCommandIdentifiers::OneBudAncMode,
+            // Adds Off to the listening modes, exactly as it does on iOS.
+            audio.push(SettingsItem::Toggle {
+                label: "Off Listening Mode",
+                value: s.allow_off_mode,
+                cmd: ControlCommandIdentifiers::AllowOffOption,
+            });
+        }
+        audio.push(SettingsItem::Toggle {
+            label: "Personalized Volume",
+            value: s.adaptive_volume,
+            cmd: ControlCommandIdentifiers::AdaptiveVolumeConfig,
+        });
+        audio.push(SettingsItem::Enum {
+            label: "Microphone",
+            // Wire values: 0x00 = Automatic, 0x01 = Right, 0x02 = Left -
+            // option order matches so index == wire value.
+            value: s.mic_mode.unwrap_or(0),
+            options: &["Automatic", "Always Right AirPod", "Always Left AirPod"],
+            cmd: ControlCommandIdentifiers::MicMode,
+        });
+        audio.push(SettingsItem::Toggle {
+            label: "Automatic Ear Detection",
+            value: s.ear_detection_enabled.unwrap_or(true),
+            cmd: ControlCommandIdentifiers::EarDetectionConfig,
+        });
+        if let Some(v) = s.sleep_detection {
+            audio.push(SettingsItem::Toggle {
+                label: "Pause Media When Falling Asleep",
+                value: v,
+                cmd: ControlCommandIdentifiers::SleepDetectionConfig,
+            });
+        }
+        audio.push(SettingsItem::Toggle {
+            label: "Connect to This Computer",
+            value: s.auto_connect.unwrap_or(true),
+            cmd: ControlCommandIdentifiers::AllowAutoConnect,
+        });
+        audio.push(SettingsItem::Slider {
+            label: "Tone Volume",
+            value: s.tone_volume.unwrap_or(50),
+            min: 15,
+            max: 100,
+            cmd: ControlCommandIdentifiers::ChimeVolume,
+        });
+        if let Some(v) = s.in_case_tone {
+            audio.push(SettingsItem::Toggle {
+                label: "Enable Charging Case Sounds",
+                value: v,
+                cmd: ControlCommandIdentifiers::InCaseToneConfig,
+            });
+        }
+        if let Some(v) = s.in_case_tone_volume {
+            audio.push(SettingsItem::Slider {
+                label: "Charging Case Sound Volume",
+                value: v,
+                min: 0,
+                max: 100,
+                cmd: ControlCommandIdentifiers::InCaseToneVolume,
             });
         }
 
-        // Stem controls
+        let mut controls = Vec::new();
         if info.has_stem_controls {
-            items.push(SettingsItem::Toggle {
+            controls.push(SettingsItem::Toggle {
                 label: "Volume Swipe",
                 value: s.volume_swipe,
                 cmd: ControlCommandIdentifiers::VolumeSwipeMode,
             });
-            items.push(SettingsItem::Enum {
+            controls.push(SettingsItem::Enum {
                 label: "Volume Swipe Length",
                 value: s.volume_swipe_length.unwrap_or(0),
                 options: &["Default", "Longer", "Longest"],
                 cmd: ControlCommandIdentifiers::VolumeSwipeInterval,
             });
-            items.push(SettingsItem::Enum {
+            controls.push(SettingsItem::Enum {
                 label: "Press Speed",
                 value: s.press_speed.unwrap_or(0),
                 options: &["Default", "Slower", "Slowest"],
                 cmd: ControlCommandIdentifiers::DoubleClickInterval,
             });
-            items.push(SettingsItem::Enum {
+            controls.push(SettingsItem::Enum {
                 label: "Press & Hold",
                 value: s.press_hold_duration.unwrap_or(0),
                 options: &["Default", "Shorter", "Shortest"],
@@ -248,51 +334,23 @@ impl App {
             });
             // Per-bud hold action; shown once the device reports it.
             if let Some(v) = s.hold_left {
-                items.push(SettingsItem::HoldMode {
+                controls.push(SettingsItem::HoldMode {
                     label: "Hold Left",
                     right: false,
                     value: hold_wire_to_idx(v),
                 });
             }
             if let Some(v) = s.hold_right {
-                items.push(SettingsItem::HoldMode {
+                controls.push(SettingsItem::HoldMode {
                     label: "Hold Right",
                     right: true,
                     value: hold_wire_to_idx(v),
                 });
             }
         }
-        // Which modes the press-and-hold gesture cycles through (only once
-        // the device reported the bitmask).
-        if s.has_anc
-            && let Some(mask) = s.listening_mode_configs
-        {
-            items.push(SettingsItem::CycleBit {
-                label: "Hold Cycle: Off",
-                bit: 0x01,
-                value: mask & 0x01 != 0,
-            });
-            items.push(SettingsItem::CycleBit {
-                label: "Hold Cycle: Noise Cancellation",
-                bit: 0x02,
-                value: mask & 0x02 != 0,
-            });
-            items.push(SettingsItem::CycleBit {
-                label: "Hold Cycle: Transparency",
-                bit: 0x04,
-                value: mask & 0x04 != 0,
-            });
-            if s.has_adaptive {
-                items.push(SettingsItem::CycleBit {
-                    label: "Hold Cycle: Adaptive",
-                    bit: 0x08,
-                    value: mask & 0x08 != 0,
-                });
-            }
-        }
         // AirPods Max digital crown.
         if !info.has_stem_controls && s.battery_headphone.is_some() {
-            items.push(SettingsItem::Enum {
+            controls.push(SettingsItem::Enum {
                 label: "Crown Direction",
                 value: if s.crown_reversed.unwrap_or(false) {
                     1
@@ -303,70 +361,68 @@ impl App {
                 cmd: ControlCommandIdentifiers::CrownRotationDirection,
             });
         }
-
-        // Sound
-        items.push(SettingsItem::Toggle {
-            label: "Personalized Volume",
-            value: s.adaptive_volume,
-            cmd: ControlCommandIdentifiers::AdaptiveVolumeConfig,
-        });
-        items.push(SettingsItem::Slider {
-            label: "Tone Volume",
-            value: s.tone_volume.unwrap_or(50),
-            min: 15,
-            max: 100,
-            cmd: ControlCommandIdentifiers::ChimeVolume,
-        });
-        if let Some(v) = s.in_case_tone {
-            items.push(SettingsItem::Toggle {
-                label: "In-Case Tone",
-                value: v,
-                cmd: ControlCommandIdentifiers::InCaseToneConfig,
+        // Which modes the press-and-hold gesture cycles through (only once
+        // the device reported the bitmask).
+        if s.has_anc
+            && let Some(mask) = s.listening_mode_configs
+        {
+            controls.push(SettingsItem::CycleBit {
+                label: "Hold Cycle: Off",
+                bit: 0x01,
+                value: mask & 0x01 != 0,
             });
-        }
-        if let Some(v) = s.in_case_tone_volume {
-            items.push(SettingsItem::Slider {
-                label: "In-Case Tone Volume",
-                value: v,
-                min: 0,
-                max: 100,
-                cmd: ControlCommandIdentifiers::InCaseToneVolume,
+            controls.push(SettingsItem::CycleBit {
+                label: "Hold Cycle: Noise Cancellation",
+                bit: 0x02,
+                value: mask & 0x02 != 0,
             });
+            controls.push(SettingsItem::CycleBit {
+                label: "Hold Cycle: Transparency",
+                bit: 0x04,
+                value: mask & 0x04 != 0,
+            });
+            if s.has_adaptive {
+                controls.push(SettingsItem::CycleBit {
+                    label: "Hold Cycle: Adaptive",
+                    bit: 0x08,
+                    value: mask & 0x08 != 0,
+                });
+            }
         }
-
-        // Behavior
-        items.push(SettingsItem::Enum {
-            label: "Mic Mode",
-            // Wire values: 0x00 = Automatic, 0x01 = Right, 0x02 = Left -
-            // option order matches so index == wire value.
-            value: s.mic_mode.unwrap_or(0),
-            options: &["Automatic", "Always Right", "Always Left"],
-            cmd: ControlCommandIdentifiers::MicMode,
-        });
         if let Some(v) = s.siri_voice_trigger {
-            items.push(SettingsItem::Toggle {
+            controls.push(SettingsItem::Toggle {
                 label: "Siri Voice Trigger",
                 value: v,
                 cmd: ControlCommandIdentifiers::VoiceTrigger,
             });
         }
-        items.push(SettingsItem::Toggle {
-            label: "Auto Ear Detection",
-            value: s.ear_detection_enabled.unwrap_or(true),
-            cmd: ControlCommandIdentifiers::EarDetectionConfig,
-        });
-        if let Some(v) = s.sleep_detection {
-            items.push(SettingsItem::Toggle {
-                label: "Sleep Detection",
-                value: v,
-                cmd: ControlCommandIdentifiers::SleepDetectionConfig,
+
+        let mut accessibility = Vec::new();
+        if let Some(value) = s.single_pod {
+            accessibility.push(SettingsItem::SinglePod {
+                label: "Use One AirPod",
+                value,
             });
         }
-        items.push(SettingsItem::Toggle {
-            label: "Auto Connect",
-            value: s.auto_connect.unwrap_or(true),
-            cmd: ControlCommandIdentifiers::AllowAutoConnect,
-        });
+        if s.has_anc {
+            accessibility.push(SettingsItem::Toggle {
+                label: "Noise Cancellation with One AirPod",
+                value: s.one_bud_anc,
+                cmd: ControlCommandIdentifiers::OneBudAncMode,
+            });
+        }
+
+        // A header only earns its row when the group under it has one.
+        for (title, group) in [
+            ("Audio & Routing", audio),
+            ("Controls & Gestures", controls),
+            ("Accessibility", accessibility),
+        ] {
+            if !group.is_empty() {
+                items.push(SettingsItem::Header(title));
+                items.extend(group);
+            }
+        }
         items
     }
 
@@ -382,8 +438,10 @@ impl App {
                     if let Some(DeviceState::AirPods(s)) = self.devices.get_mut(&mac) {
                         s.name = name;
                         // AACP events may arrive before DeviceConnected and
-                        // auto-create the entry without model info; fill it in.
-                        if product_id != 0 && s.product_id == 0 {
+                        // auto-create the entry without model info, and a
+                        // nearby entry had its controls held back; fill in.
+                        let was_connected = std::mem::replace(&mut s.connected, true);
+                        if product_id != 0 && (s.product_id == 0 || !was_connected) {
                             let info = crate::devices::apple_models::model_info(product_id);
                             s.product_id = product_id;
                             s.has_anc = info.has_anc;
@@ -394,6 +452,7 @@ impl App {
                 } else {
                     let info = crate::devices::apple_models::model_info(product_id);
                     let mut s = AirPodsDeviceState::new(name);
+                    s.connected = true;
                     s.product_id = product_id;
                     s.has_anc = info.has_anc;
                     s.has_adaptive = info.has_adaptive;
@@ -402,6 +461,26 @@ impl App {
                     }
                     self.devices.insert(mac.clone(), DeviceState::AirPods(s));
                     self.device_order.push(mac);
+                }
+            }
+            AppEvent::DeviceNearby {
+                mac,
+                name,
+                product_id,
+            } => {
+                match self.devices.get_mut(&mac) {
+                    // A live session says more than a broadcast.
+                    Some(DeviceState::AirPods(s)) if s.connected => {}
+                    Some(DeviceState::AirPods(s)) => {
+                        s.name = name;
+                        s.set_nearby_model(product_id);
+                    }
+                    None => {
+                        let mut s = AirPodsDeviceState::new(name);
+                        s.set_nearby_model(product_id);
+                        self.devices.insert(mac.clone(), DeviceState::AirPods(s));
+                        self.device_order.push(mac);
+                    }
                 }
             }
             AppEvent::DeviceDisconnected(mac) => {
@@ -450,6 +529,10 @@ impl App {
                 AACPEvent::BatteryInfo(infos) => {
                     for b in infos {
                         match b.component {
+                            // A pod that went dark (in a closed case, out of
+                            // range) reports 0/Disconnected; keep its last level.
+                            BatteryComponent::Left | BatteryComponent::Right
+                                if b.status == BatteryStatus::Disconnected => {}
                             BatteryComponent::Left => {
                                 state.battery_left = Some((b.level, b.status));
                             }
@@ -513,6 +596,12 @@ impl App {
                 }
                 AACPEvent::ConnectedDevices(_, new_devices) => {
                     state.peer_devices = new_devices;
+                }
+                AACPEvent::CaseLid(lid) => {
+                    state.case_lid = lid;
+                }
+                AACPEvent::SinglePod(on) => {
+                    state.single_pod = Some(on);
                 }
                 AACPEvent::ControlCommand(cmd) => {
                     // ClickHoldMode is the one two-byte command:
@@ -606,6 +695,14 @@ impl App {
         }
     }
 
+    pub fn send_single_pod(&self, mac: &str, on: bool) {
+        if let Some(tx) = &self.command_tx
+            && let Err(e) = tx.send((mac.to_string(), DeviceCommand::SetSinglePod(on)))
+        {
+            log::warn!("Failed to send the one-pod setting: {}", e);
+        }
+    }
+
     pub fn send_rename(&self, mac: &str, name: String) {
         if let Some(tx) = &self.command_tx
             && let Err(e) = tx.send((mac.to_string(), DeviceCommand::Rename(name.clone())))
@@ -629,6 +726,8 @@ pub fn hold_idx_to_wire(idx: u8) -> u8 {
 /// Describes a single settings row, used by both UI and event handling.
 #[derive(Debug, Clone)]
 pub enum SettingsItem {
+    /// A group title. Drawn, but never selectable: navigation steps over it.
+    Header(&'static str),
     Toggle {
         label: &'static str,
         value: bool,
@@ -653,6 +752,8 @@ pub enum SettingsItem {
         bit: u8,
         value: bool,
     },
+    /// Keep playing while only one pod is in an ear (a daemon setting).
+    SinglePod { label: &'static str, value: bool },
     /// Press-and-hold action for one bud (0x16): 0 = Noise Control, 1 = Siri.
     HoldMode {
         label: &'static str,
@@ -759,6 +860,65 @@ mod tests {
     }
 
     #[test]
+    fn a_nearby_device_is_shown_but_not_connected() {
+        let (mut app, _) = mk_app();
+        app.handle_event(AppEvent::DeviceNearby {
+            mac: MAC.into(),
+            name: "MyPods".into(),
+            product_id: PRO2,
+        });
+        let s = airpods(&app, MAC);
+        assert!(!s.connected);
+        assert_eq!(s.name, "MyPods");
+        assert_eq!(s.model.as_deref(), Some("AirPods Pro 2"));
+        // Nothing to control without a session.
+        assert!(!s.has_anc);
+
+        app.handle_event(connected(MAC, "MyPods", PRO2));
+        let s = airpods(&app, MAC);
+        assert!(s.connected);
+        assert!(s.has_anc);
+
+        // A broadcast never demotes a connected device.
+        app.handle_event(AppEvent::DeviceNearby {
+            mac: MAC.into(),
+            name: "Other".into(),
+            product_id: PRO2,
+        });
+        let s = airpods(&app, MAC);
+        assert!(s.connected);
+        assert_eq!(s.name, "MyPods");
+    }
+
+    #[test]
+    fn the_one_pod_setting_appears_once_the_daemon_reports_it() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "MyPods", PRO2));
+        let has_row = |app: &App| {
+            app.settings_items()
+                .iter()
+                .any(|i| matches!(i, SettingsItem::SinglePod { .. }))
+        };
+        assert!(!has_row(&app));
+        app.handle_event(aacp(MAC, AE::SinglePod(true)));
+        assert_eq!(airpods(&app, MAC).single_pod, Some(true));
+        assert!(app.settings_items().iter().any(
+            |i| matches!(i, SettingsItem::SinglePod { value: true, label } if *label == "Use One AirPod")
+        ));
+    }
+
+    #[test]
+    fn case_lid_events_update_the_state() {
+        use crate::bluetooth::aacp::LidState;
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "MyPods", PRO2));
+        app.handle_event(aacp(MAC, AE::CaseLid(Some(LidState::Closed))));
+        assert_eq!(airpods(&app, MAC).case_lid, Some(LidState::Closed));
+        app.handle_event(aacp(MAC, AE::CaseLid(None)));
+        assert_eq!(airpods(&app, MAC).case_lid, None);
+    }
+
+    #[test]
     fn device_disconnected_removes_and_clamps_index() {
         let (mut app, _) = mk_app();
         app.handle_event(connected("A", "a", PRO2));
@@ -825,6 +985,30 @@ mod tests {
         );
     }
 
+    /// Captured: closing the lid on the left pod reported Left=0/Disconnected,
+    /// which the TUI and waybar showed as an empty battery.
+    #[test]
+    fn a_pod_going_dark_keeps_its_last_level() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", PRO2));
+        let report = |level, status| {
+            aacp(
+                MAC,
+                AE::BatteryInfo(vec![BatteryInfo {
+                    component: BatteryComponent::Left,
+                    level,
+                    status,
+                }]),
+            )
+        };
+        app.handle_event(report(69, BatteryStatus::Charging));
+        app.handle_event(report(0, BatteryStatus::Disconnected));
+        assert_eq!(
+            airpods(&app, MAC).battery_left,
+            Some((69, BatteryStatus::Charging))
+        );
+    }
+
     #[test]
     fn ear_detection_event_updates_state() {
         let (mut app, _) = mk_app();
@@ -846,10 +1030,12 @@ mod tests {
     /// Label of any settings row.
     fn item_label(i: &SettingsItem) -> &'static str {
         match i {
+            SettingsItem::Header(title) => title,
             SettingsItem::Toggle { label, .. } => label,
             SettingsItem::Enum { label, .. } => label,
             SettingsItem::Slider { label, .. } => label,
             SettingsItem::CycleBit { label, .. } => label,
+            SettingsItem::SinglePod { label, .. } => label,
             SettingsItem::HoldMode { label, .. } => label,
         }
     }
@@ -917,10 +1103,31 @@ mod tests {
         app.handle_event(connected(MAC, "Pods", PRO2));
         let labels: Vec<&str> = app.settings_items().iter().map(item_label).collect();
         assert!(labels.contains(&"Conversation Awareness"));
-        assert!(labels.contains(&"NC with One AirPod"));
+        assert!(labels.contains(&"Noise Cancellation with One AirPod"));
         assert!(labels.contains(&"Press Speed"));
         assert!(labels.contains(&"Volume Swipe Length"));
-        assert!(labels.contains(&"Mic Mode"));
+        assert!(labels.contains(&"Microphone"));
+        // Grouped under the same headings iOS uses.
+        assert!(labels.contains(&"Audio & Routing"));
+        assert!(labels.contains(&"Controls & Gestures"));
+        assert!(labels.contains(&"Accessibility"));
+    }
+
+    /// A heading with nothing under it would be a dead row.
+    #[test]
+    fn no_group_heading_is_emitted_without_rows() {
+        let (mut app, _) = mk_app();
+        app.handle_event(connected(MAC, "Pods", AIRPODS3));
+        let items = app.settings_items();
+        for (i, item) in items.iter().enumerate() {
+            if matches!(item, SettingsItem::Header(_)) {
+                assert!(
+                    matches!(items.get(i + 1), Some(item) if !matches!(item, SettingsItem::Header(_))),
+                    "{} has no rows under it",
+                    item_label(item)
+                );
+            }
+        }
     }
 
     #[test]

@@ -4,9 +4,13 @@ use crate::bluetooth::aacp::AudioSourceType;
 use crate::bluetooth::aacp::ControlCommandIdentifiers;
 use crate::bluetooth::aacp::EarDetectionStatus;
 use crate::config::Config;
-use crate::handoff::{Action, HandoffFsm, RECLAIM_SETTLE_MS};
+use crate::handoff::{
+    Action, HandoffFsm, RECLAIM_SETTLE_MS, TAKEOVER_CHECK_MS, TAKEOVER_GIVE_UP_MS,
+};
+use crate::pulse_sinks::{KeepAlive, Sinks};
+use futures::StreamExt;
 use libpulse_binding::callbacks::ListResult;
-use libpulse_binding::context::introspect::{SinkInfo, SinkInputInfo};
+use libpulse_binding::context::introspect::SinkInputInfo;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet};
 use libpulse_binding::def::Retval;
 use libpulse_binding::mainloop::standard::Mainloop;
@@ -22,9 +26,11 @@ use tokio::sync::Mutex;
 
 // ── PulseAudio thread: single long-lived Mainloop + Context ──
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct OwnedCardProfileInfo {
     name: Option<String>,
+    priority: u32,
+    available: bool,
 }
 
 #[derive(Clone)]
@@ -32,13 +38,61 @@ struct OwnedCardInfo {
     index: u32,
     proplist: Proplist,
     profiles: Vec<OwnedCardProfileInfo>,
+    active_profile: Option<String>,
 }
 
-#[derive(Clone)]
-struct OwnedSinkInfo {
-    name: Option<String>,
-    proplist: Proplist,
-    volume: ChannelVolumes,
+/// What `activate_a2dp_profile` should do with the card's profile.
+#[derive(Debug, PartialEq, Eq)]
+enum A2dpProfileChoice {
+    /// The wanted profile is already active: switching would only make
+    /// PipeWire renegotiate the stream, an audible dropout for nothing.
+    AlreadyActive(String),
+    Switch(String),
+    Unavailable,
+}
+
+/// Pick the A2DP sink profile to activate.
+///
+/// Without an explicit preference this is the available A2DP profile with the
+/// highest priority, which is what WirePlumber itself would choose (AAC on
+/// AirPods). Hard-coding a codec order here used to force SBC-XQ over AAC,
+/// measured at 511 against 285 kbps with every frame split across two HCI
+/// packets.
+fn choose_a2dp_profile(
+    profiles: &[OwnedCardProfileInfo],
+    active: Option<&str>,
+    preferred: Option<&str>,
+) -> A2dpProfileChoice {
+    let usable = |p: &&OwnedCardProfileInfo| {
+        p.available
+            && p.name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("a2dp-sink"))
+    };
+    let preferred = preferred.and_then(|want| {
+        let found = profiles
+            .iter()
+            .filter(usable)
+            .find(|p| p.name.as_deref() == Some(want));
+        if found.is_none() {
+            warn!(
+                "Configured a2dp_profile {:?} is not available, using the default",
+                want
+            );
+        }
+        found
+    });
+    let Some(target) = preferred
+        .or_else(|| profiles.iter().filter(usable).max_by_key(|p| p.priority))
+        .and_then(|p| p.name.clone())
+    else {
+        return A2dpProfileChoice::Unavailable;
+    };
+    if active == Some(target.as_str()) {
+        A2dpProfileChoice::AlreadyActive(target)
+    } else {
+        A2dpProfileChoice::Switch(target)
+    }
 }
 
 enum AudioCommand {
@@ -68,10 +122,10 @@ enum AudioCommand {
         mac: String,
         reply: tokio::sync::oneshot::Sender<Option<String>>,
     },
-    IsProfileAvailable {
+    ChooseA2dpProfile {
         card_index: u32,
-        profile: String,
-        reply: tokio::sync::oneshot::Sender<bool>,
+        preferred: Option<String>,
+        reply: tokio::sync::oneshot::Sender<A2dpProfileChoice>,
     },
     SetDefaultSink {
         sink_name: String,
@@ -147,6 +201,7 @@ fn spawn_audio_thread(
             }
         }
         info!("PulseAudio audio thread connected and ready");
+        let mut sinks = Sinks::default();
 
         // Process commands
         while let Ok(cmd) = rx.recv() {
@@ -169,7 +224,7 @@ fn spawn_audio_thread(
                     let _ = reply.send(result);
                 }
                 AudioCommand::GetSinkVolume { sink_name, reply } => {
-                    let result = pa_get_sink_volume(&mut mainloop, &context, &sink_name);
+                    let result = pa_get_sink_volume(&mut sinks, &sink_name);
                     let _ = reply.send(result);
                 }
                 AudioCommand::TransitionVolume {
@@ -177,21 +232,30 @@ fn spawn_audio_thread(
                     target,
                     reply,
                 } => {
-                    let result =
-                        pa_transition_volume(&mut mainloop, &mut context, &sink_name, target);
+                    let result = pa_transition_volume(
+                        &mut mainloop,
+                        &mut context,
+                        &mut sinks,
+                        &sink_name,
+                        target,
+                    );
                     let _ = reply.send(result);
                 }
                 AudioCommand::GetSinkNameByMac { mac, reply } => {
-                    let result = pa_get_sink_name_by_mac(&mut mainloop, &context, &mac);
+                    let result = pa_get_sink_name_by_mac(&mut sinks, &mac);
                     let _ = reply.send(result);
                 }
-                AudioCommand::IsProfileAvailable {
+                AudioCommand::ChooseA2dpProfile {
                     card_index,
-                    profile,
+                    preferred,
                     reply,
                 } => {
-                    let result =
-                        pa_is_profile_available(&mut mainloop, &context, card_index, &profile);
+                    let result = pa_choose_a2dp_profile(
+                        &mut mainloop,
+                        &context,
+                        card_index,
+                        preferred.as_deref(),
+                    );
                     let _ = reply.send(result);
                 }
                 AudioCommand::SetDefaultSink { sink_name, reply } => {
@@ -221,7 +285,8 @@ fn spawn_audio_thread(
                     let _ = reply.send(result);
                 }
                 AudioCommand::HasActiveSinkInput { sink_name, reply } => {
-                    let result = pa_has_active_sink_input(&mut mainloop, &context, &sink_name);
+                    let result =
+                        pa_has_active_sink_input(&mut mainloop, &context, &mut sinks, &sink_name);
                     let _ = reply.send(result);
                 }
             }
@@ -249,12 +314,18 @@ fn pa_get_card_info_list(mainloop: &mut Mainloop, context: &Context) -> Vec<Owne
                     .iter()
                     .map(|p| OwnedCardProfileInfo {
                         name: p.name.as_ref().map(|n| n.to_string()),
+                        priority: p.priority,
+                        available: p.available,
                     })
                     .collect();
                 list.push(OwnedCardInfo {
                     index: item.index,
                     proplist: item.proplist.clone(),
                     profiles,
+                    active_profile: item
+                        .active_profile
+                        .as_ref()
+                        .and_then(|p| p.name.as_ref().map(|n| n.to_string())),
                 });
             }
             ListResult::End => *card_info_list.borrow_mut() = Some(list.clone()),
@@ -387,25 +458,17 @@ fn pa_set_sink_mute_by_name(
     *success.borrow()
 }
 
-fn pa_has_active_sink_input(mainloop: &mut Mainloop, context: &Context, sink_name: &str) -> bool {
-    let introspector = context.introspect();
-
-    let target_index = Rc::new(RefCell::new(None::<u32>));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let target_index = target_index.clone();
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                *target_index.borrow_mut() = Some(item.index);
-            }
-        }
-    });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    let Some(idx) = *target_index.borrow() else {
+fn pa_has_active_sink_input(
+    mainloop: &mut Mainloop,
+    context: &Context,
+    sinks: &mut Sinks,
+    sink_name: &str,
+) -> bool {
+    let Some(idx) = sinks.by_name(sink_name).map(|s| s.index) else {
         return false;
     };
 
+    let introspector = context.introspect();
     let active = Rc::new(RefCell::new(false));
     let op = introspector.get_sink_input_info_list({
         let active = active.clone();
@@ -424,152 +487,49 @@ fn pa_has_active_sink_input(mainloop: &mut Mainloop, context: &Context, sink_nam
     *active.borrow()
 }
 
-fn pa_get_sink_volume(mainloop: &mut Mainloop, context: &Context, sink_name: &str) -> Option<u32> {
-    let introspector = context.introspect();
-    let sink_info_option = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info_option = sink_info_option.clone();
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                let owned_item = OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
-                };
-                *sink_info_option.borrow_mut() = Some(owned_item);
-            }
-        }
-    });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    if let Some(sink_info) = sink_info_option.borrow().as_ref() {
-        let channels = sink_info.volume.len();
-        if channels == 0 {
-            return None;
-        }
-        let total: f64 = sink_info.volume.get().iter().map(|v| v.0 as f64).sum();
-        let average_raw = total / channels as f64;
-        let percent = ((average_raw / Volume::NORMAL.0 as f64) * 100.0).round() as u32;
-        Some(percent)
-    } else {
-        None
-    }
+fn pa_get_sink_volume(sinks: &mut Sinks, sink_name: &str) -> Option<u32> {
+    sinks.by_name(sink_name)?.volume_percent()
 }
 
 fn pa_transition_volume(
     mainloop: &mut Mainloop,
     context: &mut Context,
+    sinks: &mut Sinks,
     sink_name: &str,
     target_volume: u32,
 ) -> bool {
-    let introspector = context.introspect();
-    let sink_info_option = Rc::new(RefCell::new(None));
-    let op = introspector.get_sink_info_by_name(sink_name, {
-        let sink_info_option = sink_info_option.clone();
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                let owned_item = OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
-                };
-                *sink_info_option.borrow_mut() = Some(owned_item);
-            }
-        }
-    });
-    while op.get_state() == OperationState::Running {
-        mainloop.iterate(false);
-    }
-    if let Some(sink_info) = sink_info_option.borrow().as_ref() {
-        let channels = sink_info.volume.len();
-        let mut new_volumes = ChannelVolumes::default();
-        let raw = (((target_volume as f64) / 100.0) * (Volume::NORMAL.0 as f64)).round() as u32;
-        let vol = Volume(raw);
-        new_volumes.set(channels, vol);
-
-        let mut introspector = context.introspect();
-        let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
-        while op.get_state() == OperationState::Running {
-            mainloop.iterate(false);
-        }
-        true
-    } else {
+    let Some(sink) = sinks.by_name(sink_name) else {
         error!("Sink not found: {}", sink_name);
-        false
-    }
-}
+        return false;
+    };
+    let mut new_volumes = ChannelVolumes::default();
+    let raw = (((target_volume as f64) / 100.0) * (Volume::NORMAL.0 as f64)).round() as u32;
+    new_volumes.set(sink.volume.len(), Volume(raw));
 
-fn pa_get_sink_name_by_mac(
-    mainloop: &mut Mainloop,
-    context: &Context,
-    mac: &str,
-) -> Option<String> {
-    let introspector = context.introspect();
-    let sink_info_list = Rc::new(RefCell::new(Some(Vec::new())));
-    let op = introspector.get_sink_info_list({
-        let sink_info_list = sink_info_list.clone();
-        move |result: ListResult<&SinkInfo>| {
-            if let ListResult::Item(item) = result {
-                let owned_item = OwnedSinkInfo {
-                    name: item.name.as_ref().map(|s| s.to_string()),
-                    proplist: item.proplist.clone(),
-                    volume: item.volume,
-                };
-                sink_info_list
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("sink_info_list initialized as Some")
-                    .push(owned_item);
-            }
-        }
-    });
+    let mut introspector = context.introspect();
+    let op = introspector.set_sink_volume_by_name(sink_name, &new_volumes, None);
     while op.get_state() == OperationState::Running {
         mainloop.iterate(false);
     }
-
-    if let Some(list) = sink_info_list.borrow().as_ref() {
-        for sink in list {
-            if let Some(device_string) = sink.proplist.get_str("device.string")
-                && device_string.to_uppercase().contains(&mac.to_uppercase())
-                && let Some(name) = &sink.name
-            {
-                return Some(name.to_string());
-            }
-            if let Some(bluez_path) = sink.proplist.get_str("bluez.path") {
-                let mac_from_path = bluez_path
-                    .split('/')
-                    .next_back()
-                    .unwrap_or("")
-                    .replace("dev_", "")
-                    .replace('_', ":");
-                if mac_from_path.eq_ignore_ascii_case(mac)
-                    && let Some(name) = &sink.name
-                {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-    None
+    true
 }
 
-fn pa_is_profile_available(
+fn pa_get_sink_name_by_mac(sinks: &mut Sinks, mac: &str) -> Option<String> {
+    sinks.by_mac(mac).map(|s| s.name)
+}
+
+fn pa_choose_a2dp_profile(
     mainloop: &mut Mainloop,
     context: &Context,
     card_index: u32,
-    profile: &str,
-) -> bool {
+    preferred: Option<&str>,
+) -> A2dpProfileChoice {
     let cards = pa_get_card_info_list(mainloop, context);
     cards
         .iter()
         .find(|c| c.index == card_index)
-        .map(|card| {
-            card.profiles
-                .iter()
-                .any(|p| p.name.as_deref() == Some(profile))
-        })
-        .unwrap_or(false)
+        .map(|card| choose_a2dp_profile(&card.profiles, card.active_profile.as_deref(), preferred))
+        .unwrap_or(A2dpProfileChoice::Unavailable)
 }
 
 // ── Async wrappers: send command + await oneshot reply ──
@@ -643,12 +603,17 @@ async fn audio_cmd_get_sink_name_by_mac(tx: &AudioTx, mac: &str) -> Option<Strin
     .await
 }
 
-async fn audio_cmd_is_profile_available(tx: &AudioTx, card_index: u32, profile: &str) -> bool {
-    let profile = profile.to_string();
-    audio_request(tx, false, |reply| AudioCommand::IsProfileAvailable {
-        card_index,
-        profile,
-        reply,
+async fn audio_cmd_choose_a2dp_profile(
+    tx: &AudioTx,
+    card_index: u32,
+    preferred: Option<String>,
+) -> A2dpProfileChoice {
+    audio_request(tx, A2dpProfileChoice::Unavailable, |reply| {
+        AudioCommand::ChooseA2dpProfile {
+            card_index,
+            preferred,
+            reply,
+        }
     })
     .await
 }
@@ -700,7 +665,214 @@ async fn audio_cmd_has_active_sink_input(tx: &AudioTx, sink_name: &str) -> bool 
     .await
 }
 
+/// What an ear-detection change asks of playback.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EarResponse {
+    activate_a2dp: bool,
+    /// Pauses too: the last pod came out.
+    deactivate_a2dp: bool,
+    pause: bool,
+    resume: bool,
+}
+
+/// Decide how playback reacts to the pods moving.
+///
+/// Normally taking one pod out pauses and putting it back resumes. With
+/// `single_pod` a pod counts as worn as long as any pod is in an ear, so
+/// only the last one coming out pauses.
+fn ear_response(
+    old: [Option<EarDetectionStatus>; 2],
+    new: [Option<EarDetectionStatus>; 2],
+    single_pod: bool,
+) -> EarResponse {
+    let worn = |pods: [Option<EarDetectionStatus>; 2]| -> Vec<bool> {
+        pods.into_iter()
+            .flatten()
+            .map(|s| s == EarDetectionStatus::InEar)
+            .collect()
+    };
+    let (old_in, new_in) = (worn(old), worn(new));
+    let old_all_out = old_in.iter().all(|&b| !b);
+    let new_any_in = new_in.iter().any(|&b| b);
+    let wearing = if single_pod {
+        new_any_in
+    } else {
+        new_in.iter().all(|&b| b)
+    };
+
+    let mut response = EarResponse::default();
+    if new_any_in && old_all_out {
+        response.activate_a2dp = true;
+    } else if !new_any_in && !old_all_out {
+        // Only on the transition: the AirPods echo redundant ear states, and
+        // re-deactivating A2DP each time made wireplumber renegotiate.
+        response.deactivate_a2dp = true;
+    }
+    let (mut old_sorted, mut new_sorted) = (old_in, new_in);
+    old_sorted.sort();
+    new_sorted.sort();
+    if old_sorted != new_sorted {
+        // Resuming needs a pod in an ear. A session's first report has no
+        // previous state and looks like "all out"; observed resuming a video
+        // with both pods still in the case, where nobody could hear it.
+        if wearing || (old_all_out && new_any_in) {
+            response.resume = true;
+        } else if !old_all_out {
+            response.pause = true;
+        }
+    }
+    response
+}
+
 // ── MediaController ──
+
+/// Players paused because the pods came out, per device, kept across AACP
+/// sessions. Observed: with both pods in the case the AirPods dropped this
+/// host as soon as the iPhone connected, so the session that pauses is not
+/// the one that sees the pods come back.
+static PAUSED_FOR_EARS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn paused_for_ears()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, Vec<String>>> {
+    PAUSED_FOR_EARS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether this host was playing to `mac` when its pods came out, and has not
+/// resumed since: then this host should get the AirPods back.
+pub(crate) fn was_playing_before_pods_came_out(mac: &str) -> bool {
+    paused_for_ears().get(mac).is_some_and(|s| !s.is_empty())
+}
+
+/// Fallback poll for players that do not signal PlaybackStatus changes.
+const PLAYBACK_POLL: Duration = Duration::from_secs(2);
+
+/// PlaybackStatus change signals from every MPRIS player, on a connection of
+/// their own: queries go over the shared session connection, and a reply
+/// must never queue behind signals nobody is reading (issue #3).
+pub(crate) async fn mpris_status_signals() -> zbus::Result<(zbus::Connection, zbus::MessageStream)>
+{
+    let conn = zbus::connection::Builder::session()?.build().await?;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.DBus.Properties")?
+        .member("PropertiesChanged")?
+        .path("/org/mpris/MediaPlayer2")?
+        .arg(0, "org.mpris.MediaPlayer2.Player")?
+        .build();
+    let stream = zbus::MessageStream::for_match_rule(rule, &conn, Some(16)).await?;
+    Ok((conn, stream))
+}
+
+/// Wait until a player (not a KDE Connect mirror of a phone) switches to
+/// Playing, and return its bus name. `None` once the stream ends.
+pub(crate) async fn next_playing(
+    conn: &zbus::Connection,
+    stream: &mut zbus::MessageStream,
+) -> Option<String> {
+    loop {
+        let msg = stream.next().await?.ok()?;
+        let Ok((_, changed, _)) = msg.body().deserialize::<(
+            String,
+            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            Vec<String>,
+        )>() else {
+            continue;
+        };
+        let playing = changed
+            .get("PlaybackStatus")
+            .and_then(|v| String::try_from(v.clone()).ok())
+            .is_some_and(|s| s == "Playing");
+        if !playing {
+            continue;
+        }
+        let Some(sender) = msg.header().sender().map(|s| s.to_string()) else {
+            continue;
+        };
+        match player_name(conn, &sender).await {
+            Some(name) if MediaController::is_kdeconnect_service(&name) => continue,
+            Some(name) => return Some(name),
+            None => return Some(sender),
+        }
+    }
+}
+
+/// Whether any player (KDE Connect mirrors aside) is playing right now.
+pub(crate) async fn any_player_playing(conn: &zbus::Connection) -> bool {
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    let Ok(names) = dbus.list_names().await else {
+        return false;
+    };
+    for name in names {
+        if !name.starts_with("org.mpris.MediaPlayer2.")
+            || MediaController::is_kdeconnect_service(&name)
+        {
+            continue;
+        }
+        let proxy = zbus::proxy::Builder::new(conn)
+            .destination(name.to_string())
+            .and_then(|b| b.path("/org/mpris/MediaPlayer2"))
+            .and_then(|b| b.interface("org.mpris.MediaPlayer2.Player"))
+            .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No));
+        let Ok(builder) = proxy else { continue };
+        let Ok(player) = builder.build().await else {
+            continue;
+        };
+        if MediaController::is_playing(&player).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// The well-known MPRIS name owned by the unique bus name `sender`.
+async fn player_name(conn: &zbus::Connection, sender: &str) -> Option<String> {
+    let dbus = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+    for name in dbus.list_names().await.ok()? {
+        if !name.starts_with("org.mpris.MediaPlayer2.") {
+            continue;
+        }
+        let Ok(bus_name) = zbus::names::BusName::try_from(name.as_str()) else {
+            continue;
+        };
+        if dbus
+            .get_name_owner(bus_name)
+            .await
+            .is_ok_and(|owner| owner.as_str() == sender)
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Wait for a signal that changes some player's PlaybackStatus. Returns true
+/// when the stream ended; never resolves without a stream.
+async fn next_status_change(signals: &mut Option<(zbus::Connection, zbus::MessageStream)>) -> bool {
+    let Some((_, stream)) = signals.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        let Some(Ok(msg)) = stream.next().await else {
+            return true;
+        };
+        let Ok((_, changed, _)) = msg.body().deserialize::<(
+            String,
+            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            Vec<String>,
+        )>() else {
+            continue;
+        };
+        if changed.contains_key("PlaybackStatus") {
+            return false;
+        }
+    }
+}
 
 struct MediaControllerState {
     connected_device_mac: String,
@@ -708,12 +880,19 @@ struct MediaControllerState {
     is_playing: bool,
     paused_by_app_services: Vec<String>,
     device_index: Option<u32>,
-    cached_a2dp_profile: String,
     conv_original_volume: Option<u32>,
     conv_conversation_started: bool,
     playback_listener_running: bool,
     /// Who owns the audio session; see `handoff` for the transition rules.
     handoff: HandoffFsm,
+    /// The peer the AirPods last named as playing media, until it reports
+    /// that it stopped or we take over. While set, a claim waits for the
+    /// peer's stream to close before local playback goes on.
+    streaming_peer: Option<String>,
+    /// Players paused while a peer held the stream, resumed once it lets go.
+    takeover_paused: Vec<String>,
+    /// Silence played into the AirPods sink while waiting on a peer.
+    keepalive: Option<KeepAlive>,
     config: Config,
     audio_tx: std::sync::mpsc::Sender<AudioCommand>,
     session_conn: Option<zbus::Connection>,
@@ -731,11 +910,13 @@ impl MediaControllerState {
             is_playing: false,
             paused_by_app_services: Vec::new(),
             device_index: None,
-            cached_a2dp_profile: String::new(),
             conv_original_volume: None,
             conv_conversation_started: false,
             playback_listener_running: false,
             handoff: HandoffFsm::default(),
+            streaming_peer: None,
+            takeover_paused: Vec::new(),
+            keepalive: None,
             config,
             audio_tx,
             session_conn: None,
@@ -756,6 +937,10 @@ impl MediaController {
         app_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
     ) -> Self {
         let mut state = MediaControllerState::new(config, app_tx);
+        state.paused_by_app_services = paused_for_ears()
+            .get(&connected_mac)
+            .cloned()
+            .unwrap_or_default();
         state.connected_device_mac = connected_mac;
         state.local_mac = local_mac;
         MediaController {
@@ -769,7 +954,12 @@ impl MediaController {
         if let Some(ref conn) = state.session_conn {
             return Some(conn.clone());
         }
-        match zbus::Connection::session().await {
+        // A player that never answers must not wedge the playback loop.
+        let conn = match zbus::connection::Builder::session() {
+            Ok(builder) => builder.method_timeout(Duration::from_secs(5)).build().await,
+            Err(e) => Err(e),
+        };
+        match conn {
             Ok(conn) => {
                 state.session_conn = Some(conn.clone());
                 Some(conn)
@@ -798,8 +988,28 @@ impl MediaController {
 
     async fn playback_listener_loop(&self, aacp_manager: AACPManager) {
         info!("Starting playback listener loop");
+        // Players announce PlaybackStatus changes, so react to those at once;
+        // the slow poll only catches players that do not signal, and notices
+        // the session closing.
+        let mut signals = match mpris_status_signals().await {
+            Ok(signals) => Some(signals),
+            Err(e) => {
+                warn!("MPRIS signals unavailable, polling only: {}", e);
+                None
+            }
+        };
+        let mut poll = tokio::time::interval(PLAYBACK_POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let mut signals_ended = false;
+            tokio::select! {
+                _ = poll.tick() => {}
+                ended = next_status_change(&mut signals) => signals_ended = ended,
+            }
+            if signals_ended {
+                warn!("MPRIS signal stream ended, polling only");
+                signals = None;
+            }
 
             // Exit when the L2CAP session is gone (recv_thread/disconnect
             // clear the sender). Otherwise this loop outlives the session and
@@ -830,7 +1040,11 @@ impl MediaController {
                     continue;
                 }
 
-                let actions = self.state.lock().await.handoff.on_local_play();
+                let actions = {
+                    let mut state = self.state.lock().await;
+                    let peer_streaming = state.streaming_peer.is_some();
+                    state.handoff.on_local_play(peer_streaming)
+                };
                 if actions.is_empty() {
                     debug!("Playback started but Linux already owns the session, no claim needed");
                     continue;
@@ -852,7 +1066,9 @@ impl MediaController {
         Box::pin(async move {
             for action in actions {
                 match action {
-                    Action::PauseTracked => self.pause().await,
+                    Action::PauseTracked => {
+                        self.pause().await;
+                    }
                     Action::PauseUntracked => self.pause_all_media().await,
                     Action::ClaimOwnership | Action::ReleaseOwnership => {
                         let byte = if action == Action::ClaimOwnership {
@@ -869,6 +1085,53 @@ impl MediaController {
                         {
                             error!("Failed to send OwnsConnection={:02x}: {}", byte, e);
                         }
+                        if action == Action::ClaimOwnership {
+                            self.announce_streaming(aacp).await;
+                        }
+                    }
+                    Action::ScheduleTakeoverCheck { generation } => {
+                        self.schedule(aacp, TAKEOVER_CHECK_MS, move |fsm| {
+                            fsm.on_takeover_check(generation)
+                        });
+                    }
+                    Action::ScheduleTakeoverGiveUp { generation } => {
+                        self.schedule(aacp, TAKEOVER_GIVE_UP_MS, move |fsm| {
+                            fsm.on_takeover_give_up(generation)
+                        });
+                    }
+                    Action::PauseForTakeover => {
+                        let paused = self.pause_playing_players().await;
+                        info!(
+                            "Peer still holds the AirPods; holding {} player(s) until they switch",
+                            paused.len()
+                        );
+                        let mut state = self.state.lock().await;
+                        state.is_playing = false;
+                        state.takeover_paused = paused;
+                    }
+                    Action::ResumeAfterTakeover => {
+                        let services = std::mem::take(&mut self.state.lock().await.takeover_paused);
+                        info!(
+                            "AirPods switched to Linux, resuming {} player(s)",
+                            services.len()
+                        );
+                        self.play_services(&services).await;
+                    }
+                    Action::StartKeepAlive => {
+                        let (mac, audio_tx) = {
+                            let state = self.state.lock().await;
+                            (state.connected_device_mac.clone(), state.audio_tx.clone())
+                        };
+                        let keepalive = audio_cmd_get_sink_name_by_mac(&audio_tx, &mac)
+                            .await
+                            .and_then(|sink| KeepAlive::start(&sink));
+                        if keepalive.is_none() {
+                            warn!("Could not start the handoff keep-alive stream");
+                        }
+                        self.state.lock().await.keepalive = keepalive;
+                    }
+                    Action::StopKeepAlive => {
+                        self.state.lock().await.keepalive = None;
                     }
                     Action::ScheduleReclaim { generation } => {
                         info!(
@@ -902,6 +1165,92 @@ impl MediaController {
                 }
             }
         })
+    }
+
+    /// Tell every other host on the AirPods that this one is streaming, the
+    /// way Apple hosts tell one another, so the one in use keeps them.
+    async fn announce_streaming(&self, aacp: &AACPManager) {
+        let local_mac = self.state.lock().await.local_mac.clone();
+        let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|n| n.trim().to_string())
+            .ok()
+            .filter(|n| !n.is_empty() && n.len() <= 32)
+            .unwrap_or_else(|| "Linux".to_string());
+        let peers: Vec<String> = aacp
+            .state
+            .lock()
+            .await
+            .connected_devices
+            .iter()
+            .map(|d| d.mac.clone())
+            .filter(|mac| !mac.eq_ignore_ascii_case(&local_mac))
+            .collect();
+        for peer in peers {
+            info!("Telling {} that this host is streaming and in use", peer);
+            if let Err(e) = aacp
+                .send_media_information(&local_mac, &name, &peer, true)
+                .await
+            {
+                error!("Failed to send media information to {}: {}", peer, e);
+            }
+            // Sent only when the user just acted here (pressed play, or put
+            // the pods back in after playing here), so zero is the truth.
+            if let Err(e) = aacp.send_activity(&local_mac, &name, &peer, 0).await {
+                error!("Failed to send activity to {}: {}", peer, e);
+            }
+        }
+    }
+
+    /// Run `transition` against the FSM after `delay_ms` and execute whatever
+    /// it returns. Transitions check their generation, so a timer that a
+    /// fresher event superseded returns nothing.
+    fn schedule(
+        &self,
+        aacp: &AACPManager,
+        delay_ms: u64,
+        transition: impl FnOnce(&mut HandoffFsm) -> Vec<Action> + Send + 'static,
+    ) {
+        let mc = self.clone();
+        let aacp = aacp.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let actions = transition(&mut mc.state.lock().await.handoff);
+            mc.run_actions(actions, &aacp).await;
+        });
+    }
+
+    /// A session is starting while this host was playing when the pods went
+    /// into the case: claim the AirPods now, before they come out. Observed:
+    /// a session that never dropped kept the AirPods when they came out,
+    /// while a reconnected one that had not claimed lost them to the iPhone
+    /// the moment the first pod left the case.
+    pub async fn claim_if_it_was_playing_here(&self, aacp: &AACPManager) {
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        if was_playing_before_pods_came_out(&mac) {
+            info!("Session starts after the pods went in while playing here, claiming the AirPods");
+        } else if self.check_if_playing_async().await {
+            // Usually why the session exists: play was pressed here while
+            // the AirPods were worn elsewhere. Take them over the way a
+            // local play does, before the device's report of the other
+            // host's stream can pause the player.
+            info!("Session starts while something plays here, taking the AirPods");
+            let actions = {
+                let mut state = self.state.lock().await;
+                state.is_playing = true;
+                state.handoff.on_local_play(true)
+            };
+            self.run_actions(actions, aacp).await;
+            return;
+        } else {
+            return;
+        }
+        let actions = self
+            .state
+            .lock()
+            .await
+            .handoff
+            .on_reinsert_with_local_playback();
+        self.run_actions(actions, aacp).await;
     }
 
     /// OwnsConnection report from the device (01 = we own the session).
@@ -949,13 +1298,15 @@ impl MediaController {
             {
                 continue;
             }
-            if let Ok(p) = zbus::Proxy::new(
-                &conn,
-                name,
-                "/org/mpris/MediaPlayer2",
-                "org.mpris.MediaPlayer2.Player",
-            )
-            .await
+            // Uncached: these proxies live for one 500ms poll, and a caching
+            // proxy would AddMatch, GetAll and RemoveMatch every time.
+            let proxy = zbus::proxy::Builder::new(&conn)
+                .destination(name)
+                .and_then(|b| b.path("/org/mpris/MediaPlayer2"))
+                .and_then(|b| b.interface("org.mpris.MediaPlayer2.Player"))
+                .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No));
+            if let Ok(builder) = proxy
+                && let Ok(p) = builder.build().await
             {
                 players.push((service, p));
             }
@@ -1002,71 +1353,46 @@ impl MediaController {
         old_right: Option<EarDetectionStatus>,
         new_left: Option<EarDetectionStatus>,
         new_right: Option<EarDetectionStatus>,
+        single_pod: bool,
+        aacp: &AACPManager,
     ) {
-        debug!(
-            "Entering handle_ear_detection with old=({:?},{:?}), new=({:?},{:?})",
-            old_left, old_right, new_left, new_right
+        let response = ear_response([old_left, old_right], [new_left, new_right], single_pod);
+        let mac = self.state.lock().await.connected_device_mac.clone();
+        // Linux was playing when the pods came out: take the AirPods back
+        // before anything else can.
+        let reclaim = response.activate_a2dp && was_playing_before_pods_came_out(&mac);
+        if reclaim {
+            let actions = self
+                .state
+                .lock()
+                .await
+                .handoff
+                .on_reinsert_with_local_playback();
+            info!("Pod back in with local playback paused, claiming the AirPods");
+            self.run_actions(actions, aacp).await;
+        }
+        info!(
+            "Ear Detection - old=({:?},{:?}) new=({:?},{:?}) single_pod={} -> {:?}",
+            old_left, old_right, new_left, new_right, single_pod, response
         );
-
-        let old_statuses: Vec<EarDetectionStatus> =
-            [old_left, old_right].into_iter().flatten().collect();
-        let new_statuses: Vec<EarDetectionStatus> =
-            [new_left, new_right].into_iter().flatten().collect();
-
-        let old_in_ear_data: Vec<bool> = old_statuses
-            .iter()
-            .map(|s| *s == EarDetectionStatus::InEar)
-            .collect();
-        let new_in_ear_data: Vec<bool> = new_statuses
-            .iter()
-            .map(|s| *s == EarDetectionStatus::InEar)
-            .collect();
-
-        let in_ear = new_in_ear_data.iter().all(|&b| b);
-
-        let old_all_out = old_in_ear_data.iter().all(|&b| !b);
-        let new_has_at_least_one_in = new_in_ear_data.iter().any(|&b| b);
-        let new_all_out = new_in_ear_data.iter().all(|&b| !b);
-
-        debug!(
-            "Computed states: in_ear={}, old_all_out={}, new_has_at_least_one_in={}, new_all_out={}",
-            in_ear, old_all_out, new_has_at_least_one_in, new_all_out
-        );
-
-        if new_has_at_least_one_in && old_all_out {
-            debug!("Condition met: buds inserted, activating A2DP");
+        if response.activate_a2dp {
             self.activate_a2dp_profile().await;
-        } else if new_all_out && !old_all_out {
-            // Only on the ear-removal transition. Firing on every event where
-            // both buds are already out (e.g. AirPods echo redundant ear state)
-            // would re-deactivate A2DP repeatedly, forcing wireplumber to
-            // renegotiate the bluez profile and producing audible glitches.
-            debug!("Condition met: ear-out transition, pausing media");
-            self.pause().await;
+        }
+        if response.deactivate_a2dp {
+            // Only this pause means "the pods came out while playing here";
+            // a pause because another device took the audio must not later
+            // pull the AirPods back from it.
+            let paused = self.pause().await;
+            if !paused.is_empty() {
+                debug!("Pods out while playing here: remembering {:?}", paused);
+                paused_for_ears().insert(mac, paused);
+            }
             self.deactivate_a2dp_profile().await;
         }
-
-        info!(
-            "Ear Detection - old_in_ear_data: {:?}, new_in_ear_data: {:?}",
-            old_in_ear_data, new_in_ear_data
-        );
-
-        let mut old_sorted = old_in_ear_data.clone();
-        old_sorted.sort();
-        let mut new_sorted = new_in_ear_data.clone();
-        new_sorted.sort();
-        if new_sorted != old_sorted {
-            debug!("Ear data changed, checking resume/pause logic");
-            if in_ear {
-                debug!("Resuming media as buds are in ear");
-                self.resume().await;
-            } else if !old_all_out {
-                debug!("Pausing media as buds are not fully in ear");
-                self.pause().await;
-            } else {
-                debug!("Playing media");
-                self.resume().await;
-            }
+        if response.resume {
+            self.resume().await;
+        } else if response.pause {
+            self.pause().await;
         }
     }
 
@@ -1113,7 +1439,19 @@ impl MediaController {
 
         let idx = current_device_index.unwrap();
 
-        if !audio_cmd_is_a2dp(&audio_tx, idx).await {
+        // Right after a connect the card can list only the headset profiles
+        // for a moment; give A2DP a chance to appear before escalating.
+        let mut a2dp_listed = false;
+        for attempt in 0..4 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            if audio_cmd_is_a2dp(&audio_tx, idx).await {
+                a2dp_listed = true;
+                break;
+            }
+        }
+        if !a2dp_listed {
             warn!("A2DP profile not available, attempting to restart audio server");
             if self.restart_wire_plumber().await {
                 let mut state = self.state.lock().await;
@@ -1143,23 +1481,29 @@ impl MediaController {
             }
         }
 
-        let preferred_profile = self.get_preferred_a2dp_profile().await;
-        if preferred_profile.is_empty() {
-            error!("No suitable A2DP profile found");
-            return;
-        }
-
-        info!("Activating A2DP profile for AirPods: {}", preferred_profile);
         let state = self.state.lock().await;
         let device_index = state.device_index;
         let audio_tx = state.audio_tx.clone();
+        let preferred = state.config.a2dp_profile.clone();
         drop(state);
 
         if let Some(idx) = device_index {
-            let ok = audio_cmd_set_card_profile(&audio_tx, idx, &preferred_profile).await;
+            let ok = match audio_cmd_choose_a2dp_profile(&audio_tx, idx, preferred).await {
+                A2dpProfileChoice::AlreadyActive(profile) => {
+                    debug!("A2DP profile {} already active, not switching", profile);
+                    true
+                }
+                A2dpProfileChoice::Switch(profile) => {
+                    info!("Activating A2DP profile for AirPods: {}", profile);
+                    audio_cmd_set_card_profile(&audio_tx, idx, &profile).await
+                }
+                A2dpProfileChoice::Unavailable => {
+                    error!("No suitable A2DP profile found");
+                    return;
+                }
+            };
             if ok {
-                info!("Successfully activated A2DP profile: {}", preferred_profile);
-                // The sink appears shortly after the profile switch; poll
+                // The sink appears shortly after a profile switch; poll
                 // briefly so rerouting doesn't miss it.
                 let mut sink_name = None;
                 for attempt in 0..5 {
@@ -1183,24 +1527,27 @@ impl MediaController {
                     warn!("Could not find sink for MAC {} to reroute audio", mac);
                 }
             } else {
-                warn!("Failed to activate A2DP profile: {}", preferred_profile);
+                warn!("Failed to activate A2DP profile");
             }
         } else {
             error!("Device index not available for activating profile.");
         }
     }
 
-    async fn pause(&self) {
+    /// Pause playing players and remember them for an ear-detection resume;
+    /// returns the ones paused.
+    async fn pause(&self) -> Vec<String> {
         debug!("Pausing playback");
         let paused = self.pause_playing_players().await;
         if paused.is_empty() {
             info!("No playing media players found to pause");
-            return;
+            return paused;
         }
         info!("Paused {} media player(s) via DBus", paused.len());
         let mut state = self.state.lock().await;
-        state.paused_by_app_services = paused;
+        state.paused_by_app_services = paused.clone();
         state.is_playing = false;
+        paused
     }
 
     async fn mpris_call_first(&self, method: &str) {
@@ -1268,6 +1615,27 @@ impl MediaController {
             let mut state = self.state.lock().await;
             let is_local = source.mac.eq_ignore_ascii_case(&state.local_mac);
             let is_none = source.r#type == AudioSourceType::None;
+            if is_local {
+                state.streaming_peer = None;
+            } else if !is_none {
+                state.streaming_peer = Some(source.mac.clone());
+                // Playing on another device now: putting a pod back in must
+                // not pull the AirPods back here.
+                if paused_for_ears()
+                    .remove(&state.connected_device_mac)
+                    .is_some()
+                {
+                    debug!("{} plays now: forgetting that this host was", source.mac);
+                }
+            } else if state
+                .streaming_peer
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&source.mac))
+            {
+                // Only the peer itself going quiet clears it; the all-zero
+                // source the AirPods report mid-handoff says nothing about it.
+                state.streaming_peer = None;
+            }
             let linux_has_audio = state.is_playing || pa_active;
             let actions = state
                 .handoff
@@ -1321,20 +1689,32 @@ impl MediaController {
 
     async fn resume(&self) {
         debug!("Resuming playback");
-        let state = self.state.lock().await;
-        let services = state.paused_by_app_services.clone();
-        drop(state);
-
+        let services = self.state.lock().await.paused_by_app_services.clone();
         if services.is_empty() {
             info!("No services to resume");
             return;
         }
+        if self.play_services(&services).await > 0 {
+            let mut state = self.state.lock().await;
+            state.paused_by_app_services.clear();
+            if paused_for_ears()
+                .remove(&state.connected_device_mac)
+                .is_some()
+            {
+                debug!("Resumed: forgetting that the pods came out while playing here");
+            }
+        } else {
+            error!("Failed to resume any media players via DBus");
+        }
+    }
 
+    /// Send Play to each MPRIS service; returns how many accepted it.
+    async fn play_services(&self, services: &[String]) -> usize {
         let Some(conn) = self.session_conn().await else {
-            return;
+            return 0;
         };
-        let mut resumed_count = 0;
-        for service in &services {
+        let mut resumed = 0;
+        for service in services {
             if Self::is_kdeconnect_service(service) {
                 continue;
             }
@@ -1348,79 +1728,36 @@ impl MediaController {
             {
                 if p.call_noreply("Play", &()).await.is_ok() {
                     info!("Resumed playback for: {}", service);
-                    resumed_count += 1;
+                    resumed += 1;
                 } else {
                     warn!("Failed to resume {}", service);
                 }
             }
         }
-
-        if resumed_count > 0 {
-            info!("Resumed {} media player(s) via DBus", resumed_count);
-            let mut state = self.state.lock().await;
-            state.paused_by_app_services.clear();
-        } else {
-            error!("Failed to resume any media players via DBus");
-        }
+        resumed
     }
 
-    async fn get_preferred_a2dp_profile(&self) -> String {
-        let state = self.state.lock().await;
-        let device_index = state.device_index;
-        let cached_profile = state.cached_a2dp_profile.clone();
-        let audio_tx = state.audio_tx.clone();
-        drop(state);
-
-        let index = match device_index {
-            Some(i) => i,
-            None => return String::new(),
-        };
-
-        if !cached_profile.is_empty()
-            && audio_cmd_is_profile_available(&audio_tx, index, &cached_profile).await
-        {
-            return cached_profile;
-        }
-
-        let profiles_to_check = ["a2dp-sink-sbc_xq", "a2dp-sink-sbc", "a2dp-sink"];
-        for profile in profiles_to_check {
-            if audio_cmd_is_profile_available(&audio_tx, index, profile).await {
-                info!("Selected best available A2DP profile: {}", profile);
-                let mut state = self.state.lock().await;
-                state.cached_a2dp_profile = profile.to_string();
-                return profile.to_string();
-            }
-        }
-        String::new()
-    }
-
+    /// Run the configured `restart_audio_server` command, if any. Restarting
+    /// the audio server interrupts every stream on the machine, so it only
+    /// happens when the user asked for it.
     async fn restart_wire_plumber(&self) -> bool {
-        debug!("Entering restart_wire_plumber");
-        let state = self.state.lock().await;
-        let cmd = state.config.restart_audio_server.clone();
-        drop(state);
-
-        let cmd = match cmd {
-            Some(c) if !c.is_empty() => c,
-            _ => vec![
-                "systemctl".to_string(),
-                "--user".to_string(),
-                "restart".to_string(),
-                "wireplumber".to_string(),
-            ],
+        let cmd = self.state.lock().await.config.restart_audio_server.clone();
+        let Some(cmd) = cmd.filter(|c| !c.is_empty()) else {
+            info!("restart_audio_server is not configured, not restarting the audio server");
+            return false;
         };
 
         info!("Restarting audio server: {:?}", cmd);
-        let result = std::process::Command::new(&cmd[0]).args(&cmd[1..]).output();
-
-        match result {
-            Ok(output) if output.status.success() => {
+        match crate::config::run_template_cmd_with_timeout(&cmd, "", crate::config::COMMAND_TIMEOUT)
+            .await
+        {
+            Ok(()) => {
                 info!("Audio server restarted successfully");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 true
             }
-            _ => {
-                error!("Failed to restart audio server via {:?}", cmd);
+            Err(e) => {
+                error!("Failed to restart audio server via {:?}: {}", cmd, e);
                 false
             }
         }
@@ -1572,6 +1909,113 @@ impl MediaController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ears(l: EarDetectionStatus, r: EarDetectionStatus) -> [Option<EarDetectionStatus>; 2] {
+        [Some(l), Some(r)]
+    }
+
+    #[test]
+    fn taking_one_pod_out_pauses_unless_one_pod_is_in_use() {
+        use EarDetectionStatus::{InCase, InEar};
+        let both = ears(InEar, InEar);
+        let one = ears(InCase, InEar);
+        let normal = ear_response(both, one, false);
+        assert!(normal.pause && !normal.resume && !normal.deactivate_a2dp);
+        let single = ear_response(both, one, true);
+        assert!(!single.pause && !single.deactivate_a2dp);
+    }
+
+    #[test]
+    fn with_one_pod_in_use_only_the_last_pod_out_pauses() {
+        use EarDetectionStatus::{InCase, InEar, OutOfEar};
+        let response = ear_response(ears(InCase, InEar), ears(InCase, OutOfEar), true);
+        assert!(response.deactivate_a2dp && !response.resume);
+        // And the first pod back in resumes.
+        let response = ear_response(ears(InCase, OutOfEar), ears(InCase, InEar), true);
+        assert!(response.activate_a2dp && response.resume);
+    }
+
+    #[test]
+    fn a_session_starting_with_both_pods_in_the_case_does_not_resume() {
+        use EarDetectionStatus::InCase;
+        for single_pod in [false, true] {
+            let response = ear_response([None, None], ears(InCase, InCase), single_pod);
+            assert_eq!(response, EarResponse::default());
+        }
+    }
+
+    #[test]
+    fn putting_the_second_pod_back_resumes_as_before() {
+        use EarDetectionStatus::{InCase, InEar};
+        let response = ear_response(ears(InCase, InEar), ears(InEar, InEar), false);
+        assert!(response.resume && !response.pause);
+    }
+
+    /// The profiles PipeWire 1.6 lists for a pair of AirPods Pro 3.
+    fn airpods_profiles() -> Vec<OwnedCardProfileInfo> {
+        [
+            ("off", 0, true),
+            ("a2dp-sink-sbc", 132, true),
+            ("a2dp-sink-sbc_xq", 131, true),
+            ("a2dp-sink", 133, true), // AAC
+            ("headset-head-unit-cvsd", 5, true),
+            ("headset-head-unit", 6, true),
+        ]
+        .into_iter()
+        .map(|(name, priority, available)| OwnedCardProfileInfo {
+            name: Some(name.into()),
+            priority,
+            available,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn highest_priority_a2dp_profile_wins_over_sbc_xq() {
+        assert_eq!(
+            choose_a2dp_profile(&airpods_profiles(), Some("off"), None),
+            A2dpProfileChoice::Switch("a2dp-sink".into())
+        );
+        // Migrates a card an older release left on SBC-XQ.
+        assert_eq!(
+            choose_a2dp_profile(&airpods_profiles(), Some("a2dp-sink-sbc_xq"), None),
+            A2dpProfileChoice::Switch("a2dp-sink".into())
+        );
+    }
+
+    #[test]
+    fn an_active_target_profile_is_not_switched_again() {
+        assert_eq!(
+            choose_a2dp_profile(&airpods_profiles(), Some("a2dp-sink"), None),
+            A2dpProfileChoice::AlreadyActive("a2dp-sink".into())
+        );
+    }
+
+    #[test]
+    fn configured_profile_is_honoured_when_available() {
+        assert_eq!(
+            choose_a2dp_profile(&airpods_profiles(), Some("off"), Some("a2dp-sink-sbc_xq")),
+            A2dpProfileChoice::Switch("a2dp-sink-sbc_xq".into())
+        );
+        assert_eq!(
+            choose_a2dp_profile(&airpods_profiles(), Some("off"), Some("a2dp-sink-ldac")),
+            A2dpProfileChoice::Switch("a2dp-sink".into())
+        );
+    }
+
+    #[test]
+    fn unavailable_or_non_a2dp_profiles_are_never_chosen() {
+        let mut profiles = airpods_profiles();
+        for p in &mut profiles {
+            if p.name.as_deref().is_some_and(|n| n.starts_with("a2dp")) {
+                p.available = false;
+            }
+        }
+        assert_eq!(
+            choose_a2dp_profile(&profiles, Some("headset-head-unit"), None),
+            A2dpProfileChoice::Unavailable
+        );
+    }
 
     /// The listener must exit once the AACP session's sender is gone,
     /// otherwise every reconnect leaks a poll task and a PulseAudio thread.

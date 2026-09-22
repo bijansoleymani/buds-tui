@@ -4,8 +4,12 @@ mod devices;
 mod handoff;
 mod ipc;
 mod media_controller;
+mod pulse_sinks;
 mod tui;
 mod utils;
+
+#[cfg(test)]
+mod bluez_tests;
 
 use crate::bluetooth::discovery::find_connected_airpods;
 use crate::bluetooth::managers::DeviceManagers;
@@ -54,14 +58,38 @@ struct Args {
     daemon: bool,
 }
 
+const DBUS_METHOD_TIMEOUT: Duration = Duration::from_secs(5);
+const BLUEZ_SIGNAL_QUEUE: usize = 64;
+
+async fn bluez_connection() -> zbus::Result<zbus::Connection> {
+    build_bluez_connection(zbus::connection::Builder::system()?).await
+}
+
+async fn build_bluez_connection(
+    builder: zbus::connection::Builder<'_>,
+) -> zbus::Result<zbus::Connection> {
+    builder.method_timeout(DBUS_METHOD_TIMEOUT).build().await
+}
+
+async fn bluez_properties_stream(
+    conn: &zbus::Connection,
+    interface: &'static str,
+) -> zbus::Result<zbus::MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.bluez")?
+        .path_namespace("/org/bluez")?
+        .interface("org.freedesktop.DBus.Properties")?
+        .member("PropertiesChanged")?
+        .arg(0, interface)?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, conn, Some(BLUEZ_SIGNAL_QUEUE)).await
+}
+
 /// Read the BlueZ Modalias property for a device and return its Apple product ID (0 if unknown).
-async fn read_product_id(addr_str: &str) -> u16 {
+async fn read_product_id(conn: &zbus::Connection, path: &str) -> u16 {
     use crate::devices::apple_models::{APPLE_VENDOR_ID, parse_modalias};
-    let Ok(conn) = zbus::Connection::system().await else {
-        return 0;
-    };
-    let path = format!("/org/bluez/hci0/dev_{}", addr_str.replace(':', "_"));
-    zbus_get_property::<String>(&conn, &path, "org.bluez.Device1", "Modalias")
+    zbus_get_property::<String>(conn, path, "org.bluez.Device1", "Modalias")
         .await
         .and_then(|m| parse_modalias(&m))
         .filter(|(v, _)| *v == APPLE_VENDOR_ID)
@@ -84,6 +112,7 @@ async fn zbus_get_property<T: TryFrom<zbus::zvariant::OwnedValue>>(
         .ok()?
         .interface(interface)
         .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
         .build()
         .await
     {
@@ -99,12 +128,33 @@ async fn zbus_get_property<T: TryFrom<zbus::zvariant::OwnedValue>>(
     match proxy.get_property(property).await {
         Ok(val) => T::try_from(val).ok(),
         Err(e) => {
-            debug!(
+            log::log!(
+                property_error_level(&e),
                 "Failed to read {}.{} at {}: {}",
-                interface, property, path, e
+                interface,
+                property,
+                path,
+                e
             );
             None
         }
+    }
+}
+
+fn property_error_level(error: &zbus::Error) -> log::Level {
+    // A failed property read surfaces as `Error::FDO`; `fdo::Error::from` would
+    // re-wrap that as `ZBus` instead of unwrapping it, so unwrap it here and keep
+    // the conversion for peers that reply with a raw method error.
+    let error = match error {
+        zbus::Error::FDO(error) => (**error).clone(),
+        error => zbus::fdo::Error::from(error.clone()),
+    };
+    match error {
+        zbus::fdo::Error::UnknownObject(_)
+        | zbus::fdo::Error::UnknownInterface(_)
+        | zbus::fdo::Error::UnknownProperty(_)
+        | zbus::fdo::Error::UnknownMethod(_) => log::Level::Debug,
+        _ => log::Level::Warn,
     }
 }
 
@@ -151,6 +201,8 @@ fn main() -> io::Result<()> {
 
     let log_level = if args.debug { "debug" } else { "warn" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        // Handoff events land milliseconds apart; whole seconds hide their order.
+        .format_timestamp_millis()
         .target(env_logger::Target::Stderr)
         .init();
 
@@ -202,6 +254,10 @@ fn main() -> io::Result<()> {
                         let mut bat_case = None;
                         let mut bat_headphone = None;
                         for b in infos {
+                            // 0/Disconnected is "not reporting", not empty.
+                            if b.status == crate::bluetooth::aacp::BatteryStatus::Disconnected {
+                                continue;
+                            }
                             match b.component {
                                 crate::bluetooth::aacp::BatteryComponent::Left => {
                                     bat_left = Some(b.level)
@@ -209,16 +265,12 @@ fn main() -> io::Result<()> {
                                 crate::bluetooth::aacp::BatteryComponent::Right => {
                                     bat_right = Some(b.level)
                                 }
-                                crate::bluetooth::aacp::BatteryComponent::Case
-                                    if b.status
-                                        != crate::bluetooth::aacp::BatteryStatus::Disconnected =>
-                                {
+                                crate::bluetooth::aacp::BatteryComponent::Case => {
                                     bat_case = Some(b.level)
                                 }
                                 crate::bluetooth::aacp::BatteryComponent::Headphone => {
                                     bat_headphone = Some(b.level)
                                 }
-                                _ => {}
                             }
                             if b.status == crate::bluetooth::aacp::BatteryStatus::NotCharging {
                                 let key = format!("{}-{:?}", mac, b.component);
@@ -233,7 +285,11 @@ fn main() -> io::Result<()> {
                                 if threshold > 0 && threshold < prev {
                                     battery_alerted.insert(key, threshold);
                                     let msg = format!("{:?} battery: {}%", b.component, b.level);
-                                    config::run_template_cmd(&alert_cmd, &msg);
+                                    // Off this loop: it also feeds every IPC client.
+                                    let alert_cmd = alert_cmd.clone();
+                                    tokio::spawn(async move {
+                                        config::run_template_cmd(&alert_cmd, &msg).await;
+                                    });
                                 } else if threshold == 0 && prev < 100 {
                                     battery_alerted.insert(key, 100);
                                 }
@@ -411,7 +467,12 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
                     tooltip_parts.push(format!("R: {}%", r));
                 }
                 if let Some((c, _)) = s.battery_case {
-                    tooltip_parts.push(format!("C: {}%", c));
+                    let lid = match s.case_lid {
+                        Some(crate::bluetooth::aacp::LidState::Open) => " (lid open)",
+                        Some(crate::bluetooth::aacp::LidState::Closed) => " (lid closed)",
+                        None => "",
+                    };
+                    tooltip_parts.push(format!("C: {}%{}", c, lid));
                 }
                 if let Some((h, _)) = s.battery_headphone {
                     tooltip_parts.push(format!("{}%", h));
@@ -419,7 +480,8 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
                 serde_json::json!({
                     "text": format!("{}%", percentage),
                     "tooltip": tooltip_parts.join("\n"),
-                    "class": "connected",
+                    // Nearby: known from broadcasts, not connected here.
+                    "class": if s.connected { "connected" } else { "nearby" },
                     "percentage": percentage,
                 })
                 .to_string()
@@ -495,32 +557,27 @@ fn run_waybar_mode(watch: bool) -> io::Result<()> {
 /// Async task: monitor BlueZ MediaTransport1 volume changes via zbus,
 /// sync AirPods stem swipe to system volume using configured commands.
 async fn avrcp_volume_monitor(config: config::Config) {
-    let Ok(conn) = zbus::Connection::system().await else {
+    let Ok(conn) = bluez_connection().await else {
         log::error!("Failed to connect to system D-Bus for AVRCP monitor");
         return;
     };
 
-    let rule =
-        "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
-    let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
-        debug!("Failed to create DBusProxy for AVRCP volume monitor");
-        return;
+    let mut stream = match bluez_properties_stream(&conn, "org.bluez.MediaTransport1").await {
+        Ok(stream) => stream,
+        Err(e) => {
+            log::error!("Failed to subscribe to BlueZ volume changes: {}", e);
+            return;
+        }
     };
-    if let Err(e) = proxy
-        .add_match_rule(rule.try_into().expect("valid match rule"))
-        .await
-    {
-        log::error!("Failed to add AVRCP match rule: {}", e);
-        return;
-    }
-
-    let mut stream = zbus::MessageStream::from(&conn);
     // -1 = not yet seen.  First event seeds the baseline without adjusting volume.
     let mut applied_pct: i64 = -1;
     // Latest pct received but not yet dispatched (pending debounce).
     let mut pending_pct: Option<i64> = None;
-    let set_cmd = config.volume_set_command.clone();
-    let osd_cmd = config.volume_osd_command.clone();
+    // Keep draining signals while commands run. Retain only the latest target
+    // during a slow command, and serialize writes so old volume cannot win.
+    let (volume_tx, volume_rx) = tokio::sync::watch::channel(0);
+    let command_worker = apply_volume_updates(volume_rx, config);
+    tokio::pin!(command_worker);
 
     // Debounce: a single stem swipe floods ~15 AVRCP Volume events in quick succession
     // (one per ~9-unit step on the 0-127 scale).  Wait until the stream is quiet for
@@ -535,16 +592,13 @@ async fn avrcp_volume_monitor(config: config::Config) {
 
     loop {
         tokio::select! {
+            () = &mut command_worker => break,
             // Debounce timer fired - set the absolute target volume.
             () = &mut debounce_deadline, if pending_pct.is_some() => {
                 let new_pct = pending_pct.take().unwrap();
                 if applied_pct >= 0 {
                     if new_pct != applied_pct {
-                        // Pass a 0.0-1.0 fraction to volume_set_command (e.g. wpctl).
-                        let fraction = format!("{:.4}", new_pct as f64 / 100.0);
-                        config::run_template_cmd(&set_cmd, &fraction);
-                        // Show OSD without changing volume (+0 = display only)
-                        config::run_template_cmd(&osd_cmd, "+0");
+                        volume_tx.send_replace(new_pct);
                         info!("AVRCP volume swipe: {}% → {}%", applied_pct, new_pct);
                     }
                 } else {
@@ -554,7 +608,17 @@ async fn avrcp_volume_monitor(config: config::Config) {
             }
 
             msg = stream.next() => {
-                let Some(Ok(msg)) = msg else { break };
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(e)) => {
+                        log::error!("BlueZ volume stream failed: {}", e);
+                        break;
+                    }
+                    None => {
+                        log::warn!("BlueZ volume stream closed");
+                        break;
+                    }
+                };
 
                 let header = msg.header();
                 if header.message_type() != zbus::message::Type::Signal {
@@ -598,6 +662,19 @@ async fn avrcp_volume_monitor(config: config::Config) {
     }
 }
 
+async fn apply_volume_updates(
+    mut volume_rx: tokio::sync::watch::Receiver<i64>,
+    config: config::Config,
+) {
+    while volume_rx.changed().await.is_ok() {
+        let pct = *volume_rx.borrow_and_update();
+        let fraction = format!("{:.4}", pct as f64 / 100.0);
+        config::run_template_cmd(&config.volume_set_command, &fraction).await;
+        // Show OSD without changing volume (+0 = display only).
+        config::run_template_cmd(&config.volume_osd_command, "+0").await;
+    }
+}
+
 /// Async task: listen for BlueZ device connection/disconnection via zbus PropertiesChanged signals.
 async fn bluez_connection_listener(
     conn: zbus::Connection,
@@ -606,109 +683,152 @@ async fn bluez_connection_listener(
     devices_list: HashMap<String, DeviceData>,
     config: config::Config,
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<(Address, u16)>,
-) {
-    let rule =
-        "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
-    let Ok(proxy) = zbus::fdo::DBusProxy::new(&conn).await else {
-        debug!("Failed to create DBusProxy for BlueZ connection listener");
-        return;
-    };
-    if let Err(e) = proxy
-        .add_match_rule(rule.try_into().expect("valid match rule"))
-        .await
+) -> zbus::Result<()> {
+    // A separate socket receives method replies even if the signal socket is
+    // back-pressured. Property calls also have a finite timeout.
+    let query_conn = bluez_connection().await?;
+    let stream = bluez_properties_stream(&conn, "org.bluez.Device1").await?;
+    handle_bluez_connections(
+        stream,
+        query_conn,
+        devices_list,
+        AirPodsInitContext {
+            app_tx,
+            device_managers,
+            config,
+            reconnect_tx,
+        },
+    )
+    .await
+}
+
+struct AirPodsConnectionInfo {
+    addr: Address,
+    name: String,
+    product_id: u16,
+}
+
+async fn lookup_airpods(
+    conn: &zbus::Connection,
+    path: &str,
+    addr: Address,
+    remembered_name: Option<String>,
+) -> Option<AirPodsConnectionInfo> {
+    let uuids: Vec<String> = zbus_get_property(conn, path, "org.bluez.Device1", "UUIDs").await?;
+    if !uuids
+        .iter()
+        .any(|u| u.eq_ignore_ascii_case(AIRPODS_AACP_UUID))
     {
-        log::error!("Failed to add BlueZ match rule: {}", e);
-        return;
+        return None;
     }
+    let bt_name = zbus_get_property(conn, path, "org.bluez.Device1", "Name")
+        .await
+        .unwrap_or_else(|| "Unknown AirPods".to_string());
+    Some(AirPodsConnectionInfo {
+        addr,
+        name: remembered_name.unwrap_or(bt_name),
+        product_id: read_product_id(conn, path).await,
+    })
+}
 
-    let mut stream = zbus::MessageStream::from(&conn);
+fn address_from_bluez_path(path: &str) -> Option<Address> {
+    let (adapter, device) = path.strip_prefix("/org/bluez/")?.split_once('/')?;
+    adapter.strip_prefix("hci")?.parse::<u32>().ok()?;
+    device.strip_prefix("dev_")?.replace('_', ":").parse().ok()
+}
 
-    while let Some(msg) = stream.next().await {
-        let Ok(msg) = msg else { continue };
+async fn handle_bluez_connections(
+    mut stream: impl futures::Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+    query_conn: zbus::Connection,
+    devices_list: HashMap<String, DeviceData>,
+    ctx: AirPodsInitContext,
+) -> zbus::Result<()> {
+    // At most one lookup per device. Disconnect cancels its lookup, and task
+    // IDs prevent an old completion from initializing a newer connection.
+    // JoinSet aborts remaining lookups when the listener exits.
+    let mut lookups = tokio::task::JoinSet::new();
+    let mut pending: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+    loop {
+        let msg = tokio::select! {
+            result = lookups.join_next_with_id(), if !lookups.is_empty() => {
+                match result {
+                    Some(Ok((id, (path, info)))) => {
+                        if pending.get(&path).is_some_and(|task| task.id() == id) {
+                            pending.remove(&path);
+                            if let Some(AirPodsConnectionInfo { addr, name, product_id }) = info {
+                                info!("AirPods connected: {}, product_id=0x{:04x}, initializing", name, product_id);
+                                spawn_airpods_init(addr, name, product_id, ctx.clone());
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        pending.retain(|_, task| task.id() != e.id());
+                        if !e.is_cancelled() {
+                            return Err(zbus::Error::Failure(format!("BlueZ lookup task failed: {e}")));
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            msg = stream.next() => match msg {
+                Some(msg) => msg?,
+                None => return Err(zbus::Error::Failure("BlueZ device stream closed".into())),
+            },
+        };
 
         let header = msg.header();
-        if header.message_type() != zbus::message::Type::Signal {
-            continue;
-        }
-
         let Some(path) = header.path() else { continue };
-        let path_str = path.as_str().to_string();
-        if !path_str.contains("/org/bluez/hci") || !path_str.contains("/dev_") {
+        let path = path.as_str();
+        let Some(addr) = address_from_bluez_path(path) else {
             continue;
-        }
-
-        let Ok(body) = msg.body().deserialize::<(
+        };
+        let Ok((interface, changed, _)) = msg.body().deserialize::<(
             String,
             HashMap<String, zbus::zvariant::OwnedValue>,
             Vec<String>,
         )>() else {
             continue;
         };
-
-        let (iface, changed, _) = body;
-        if iface != "org.bluez.Device1" {
+        if interface != "org.bluez.Device1" {
             continue;
         }
-
-        let Some(connected_val) = changed.get("Connected") else {
-            continue;
-        };
-        let Ok(is_connected) = bool::try_from(connected_val) else {
-            continue;
-        };
-
-        let Some(addr_str) =
-            zbus_get_property::<String>(&conn, &path_str, "org.bluez.Device1", "Address").await
+        let Some(connected) = changed
+            .get("Connected")
+            .and_then(|v| bool::try_from(v).ok())
         else {
             continue;
         };
-
-        if !is_connected {
-            if let Err(e) = app_tx.send(AppEvent::DeviceDisconnected(addr_str.clone())) {
-                debug!("Failed to send DeviceDisconnected for {}: {}", addr_str, e);
+        if !connected {
+            if let Some(task) = pending.remove(path) {
+                task.abort();
             }
+            // The object may already be removed. Its path still supplies the
+            // address without a property request against a missing object.
+            let _ = ctx
+                .app_tx
+                .send(AppEvent::DeviceDisconnected(addr.to_string()));
+            continue;
+        }
+        if pending.contains_key(path) {
             continue;
         }
 
-        let Ok(addr) = addr_str.parse::<Address>() else {
-            continue;
-        };
-
-        // AirPods: check UUID
-        let uuids: Option<Vec<String>> =
-            zbus_get_property(&conn, &path_str, "org.bluez.Device1", "UUIDs").await;
-        let Some(uuids) = uuids else { continue };
-        if !uuids.iter().any(|u| u.to_lowercase() == AIRPODS_AACP_UUID) {
-            continue;
-        }
-
-        let bt_name: String = zbus_get_property(&conn, &path_str, "org.bluez.Device1", "Name")
-            .await
-            .unwrap_or_else(|| "Unknown AirPods".to_string());
-        let name = devices_list
-            .get(&addr_str)
+        let remembered_name = devices_list
+            .get(&addr.to_string())
             .filter(|d| !d.name.is_empty())
-            .map(|d| d.name.clone())
-            .unwrap_or(bt_name);
-        let product_id = read_product_id(&addr_str).await;
-        info!(
-            "AirPods connected: {}, product_id=0x{:04x}, initializing",
-            name, product_id
-        );
-        spawn_airpods_init(
-            addr,
-            name,
-            product_id,
-            AirPodsInitContext {
-                app_tx: app_tx.clone(),
-                device_managers: device_managers.clone(),
-                config: config.clone(),
-                reconnect_tx: reconnect_tx.clone(),
-            },
-        );
+            .map(|d| d.name.clone());
+        let conn = query_conn.clone();
+        let lookup_path = path.to_owned();
+        let task = lookups.spawn(async move {
+            let info = lookup_airpods(&conn, &lookup_path, addr, remembered_name).await;
+            (lookup_path, info)
+        });
+        pending.insert(path.to_owned(), task);
     }
 }
 
+#[derive(Clone)]
 struct AirPodsInitContext {
     app_tx: tokio::sync::mpsc::UnboundedSender<AppEvent>,
     device_managers: Arc<RwLock<HashMap<String, DeviceManagers>>>,
@@ -827,20 +947,46 @@ async fn bluetooth_main(
         avrcp_volume_monitor(vol_config).await;
     });
 
+    // Proximity advertisements: state for devices the control channel cannot
+    // reach, e.g. sitting in the case or currently owned by a phone.
+    if config.ble_scan {
+        let adapter = adapter.clone();
+        let app_tx = app_tx.clone();
+        let dm = device_managers.clone();
+        let auto_connect = config.auto_connect;
+        tokio::spawn(async move {
+            if let Err(e) = crate::bluetooth::ble_monitor::ble_advertisement_listener(
+                adapter,
+                app_tx,
+                dm,
+                auto_connect,
+            )
+            .await
+            {
+                // Losing the scan costs the fallback state, not the session, so
+                // the daemon keeps running on the AACP path alone.
+                log::warn!("BLE advertisement scan stopped: {}", e);
+            }
+        });
+    }
+
     // Command dispatcher - receives (mac, DeviceCommand) from TUI
     let dm_cmd = device_managers.clone();
     let adapter_cmd = adapter.clone();
     tokio::spawn(async move {
         while let Some((mac, cmd)) = cmd_rx.recv().await {
-            let managers = dm_cmd.read().await;
-            if let Some(dm) = managers.get(&mac)
-                && let Some(aacp) = dm.get_aacp()
-            {
+            // Not held across the awaits below: a rename retries for up to
+            // 1.5 s, and inits and reconnects need the write lock meanwhile.
+            let aacp = dm_cmd.read().await.get(&mac).and_then(|dm| dm.get_aacp());
+            if let Some(aacp) = aacp {
                 match cmd {
                     tui::app::DeviceCommand::ControlCommand(id, value) => {
                         if let Err(e) = aacp.send_control_command(id, &value).await {
                             log::error!("Failed to send control command: {}", e);
                         }
+                    }
+                    tui::app::DeviceCommand::SetSinglePod(on) => {
+                        aacp.set_single_pod(on).await;
                     }
                     tui::app::DeviceCommand::Rename(name) => {
                         if let Err(e) = aacp.send_rename_packet(&name).await {
@@ -939,7 +1085,7 @@ async fn bluetooth_main(
 
     // Start D-Bus listener FIRST to avoid missing connections during startup checks
     info!("Listening for Bluetooth connections via D-Bus...");
-    let conn = zbus::Connection::system().await.map_err(|e| bluer::Error {
+    let conn = bluez_connection().await.map_err(|e| bluer::Error {
         kind: bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(e.to_string())),
         message: e.to_string(),
     })?;
@@ -949,9 +1095,7 @@ async fn bluetooth_main(
         let dl = devices_list.clone();
         let cfg = config.clone();
         let rtx = reconnect_tx.clone();
-        tokio::spawn(async move {
-            bluez_connection_listener(conn, app_tx, dm, dl, cfg, rtx).await;
-        })
+        tokio::spawn(async move { bluez_connection_listener(conn, app_tx, dm, dl, cfg, rtx).await })
     };
 
     // Now check for already-connected devices (listener is already active)
@@ -969,7 +1113,22 @@ async fn bluetooth_main(
                 .map(|d| d.name.clone())
                 .unwrap_or(bt_name);
             info!("Found connected AirPods: {}, initializing.", name);
-            let product_id = read_product_id(&addr_str).await;
+            // Use a separate query connection even during startup: the
+            // listener has already subscribed on `conn`.
+            let product_id = match bluez_connection().await {
+                Ok(query_conn) => {
+                    let path = format!(
+                        "/org/bluez/{}/dev_{}",
+                        adapter.name(),
+                        addr_str.replace(':', "_")
+                    );
+                    read_product_id(&query_conn, &path).await
+                }
+                Err(e) => {
+                    log::warn!("Failed to connect for product ID lookup: {}", e);
+                    0
+                }
+            };
             info!("Product ID for {}: 0x{:04x}", addr_str, product_id);
             spawn_airpods_init(
                 device.address(),
@@ -989,7 +1148,15 @@ async fn bluetooth_main(
     }
 
     // Block on the D-Bus listener
-    let _ = listener_handle.await;
+    listener_handle
+        .await
+        .map_err(bluetooth_dbus_error)?
+        .map_err(bluetooth_dbus_error)
+}
 
-    Ok(())
+fn bluetooth_dbus_error(error: impl std::fmt::Display) -> bluer::Error {
+    bluer::Error {
+        kind: bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBus(error.to_string())),
+        message: error.to_string(),
+    }
 }

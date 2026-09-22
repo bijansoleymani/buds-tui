@@ -1,6 +1,11 @@
 use log::info;
 use serde::Deserialize;
+use std::io;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -18,6 +23,18 @@ pub struct Config {
     /// component label and level, e.g. "Left battery: 18%".
     /// Set to `[]` to disable notifications.
     pub battery_alert_command: Vec<String>,
+    /// Watch Apple proximity advertisements so battery, in-ear and case state
+    /// keep updating while the control channel is down: buds in the case, or
+    /// currently owned by a phone. Requires a completed AACP session first,
+    /// which is where the identity keys come from.
+    pub ble_scan: bool,
+    /// Connect a known pair when its broadcasts show a pod in an ear while it
+    /// is not connected here. Needs `ble_scan`.
+    pub auto_connect: bool,
+    /// Card profile to use for playback, e.g. "a2dp-sink-sbc_xq". `None` (the
+    /// default) picks the highest-priority A2DP profile, the same one
+    /// WirePlumber would choose; on AirPods that is AAC.
+    pub a2dp_profile: Option<String>,
 }
 
 impl Default for Config {
@@ -36,6 +53,9 @@ impl Default for Config {
             ],
             restart_audio_server: None,
             battery_alert_command: vec!["notify-send".into(), "AirPods".into(), "{}".into()],
+            ble_scan: true,
+            auto_connect: true,
+            a2dp_profile: None,
         }
     }
 }
@@ -81,17 +101,45 @@ fn dirs_path() -> PathBuf {
 /// Uses `Command::new()` with an argv vector - no shell expansion occurs,
 /// so there is no shell-injection risk. The first element of `template` is
 /// executed directly as a binary path.
-pub fn run_template_cmd(template: &[String], value: &str) {
+pub async fn run_template_cmd(template: &[String], value: &str) {
+    if let Err(e) = run_template_cmd_with_timeout(template, value, COMMAND_TIMEOUT).await {
+        log::warn!("Integration command {:?} failed: {}", template.first(), e);
+    }
+}
+
+pub(crate) async fn run_template_cmd_with_timeout(
+    template: &[String],
+    value: &str,
+    timeout: Duration,
+) -> io::Result<()> {
     if template.is_empty() {
-        return;
+        return Ok(());
     }
     let args: Vec<String> = template
         .iter()
         .map(|arg| arg.replace("{}", value))
         .collect();
-    let _ = std::process::Command::new(&args[0])
+    let mut child = tokio::process::Command::new(&args[0])
         .args(&args[1..])
-        .output();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(io::Error::other(format!("exited with {status}"))),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            // Kill and reap explicitly; kill_on_drop also covers cancellation
+            // when the caller's stream or runtime shuts down.
+            child.kill().await?;
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("exceeded {timeout:?}; child terminated"),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -151,10 +199,42 @@ volume_set_command = ["echo", "{}"]
         );
     }
 
-    #[test]
-    fn run_template_cmd_with_empty_template_does_not_spawn() {
+    #[tokio::test]
+    async fn run_template_cmd_with_empty_template_does_not_spawn() {
         // No assertion needed beyond "doesn't panic"; an empty template must early-return
         // before std::process::Command would be invoked with index 0.
-        run_template_cmd(&[], "anything");
+        run_template_cmd(&[], "anything").await;
+    }
+
+    #[tokio::test]
+    async fn command_timeout_does_not_block_runtime() {
+        let command = vec!["sleep".into(), "30".into()];
+        let command = run_template_cmd_with_timeout(&command, "", Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let heartbeat = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(start.elapsed() < Duration::from_secs(1));
+        };
+        let (result, ()) = tokio::join!(command, heartbeat);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn template_substitution_is_literal_and_failed_exits_are_reported() {
+        let command = vec![
+            "test".into(),
+            "{}".into(),
+            "=".into(),
+            "$(exit 99); `false`".into(),
+        ];
+        run_template_cmd_with_timeout(&command, "$(exit 99); `false`", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            run_template_cmd_with_timeout(&["false".into()], "", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
     }
 }

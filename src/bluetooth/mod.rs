@@ -1,4 +1,6 @@
 pub mod aacp;
+pub(crate) mod ble;
+pub(crate) mod ble_monitor;
 pub(crate) mod discovery;
 pub mod managers;
 

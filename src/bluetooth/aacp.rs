@@ -34,6 +34,8 @@ pub mod opcodes {
     pub const STEM_PRESS: u8 = 0x19;
     pub const CONNECTED_DEVICES: u8 = 0x2E;
     pub const AUDIO_SOURCE: u8 = 0x0E;
+    /// Relayed by the AirPods to another connected Apple device.
+    pub const SMART_ROUTING: u8 = 0x10;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -222,9 +224,52 @@ pub enum AACPEvent {
     StemPress(StemPressType, Option<StemPressBudType>),
     /// L2CAP connection dropped (read error or remote close).
     ConnectionLost,
+    /// The charging case lid, or `None` while no pod sits in the case and
+    /// nothing can tell. Derived from ear detection over AACP, and read
+    /// straight from proximity advertisements while disconnected.
+    CaseLid(Option<LidState>),
+    /// Whether the device is used one pod at a time (a daemon setting,
+    /// remembered per device, not an AirPods one).
+    SinglePod(bool),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Whether the charging case is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LidState {
+    Open,
+    Closed,
+}
+
+/// Infer the lid from ear-detection transitions.
+///
+/// A pod in the case only stays connected while the lid is open; closing it
+/// drops that pod, which reports as `InCase -> Disconnected`. That transition
+/// wins over a stale `InCase` from the other pod, whose report lags when both
+/// sit in the case. A pod that went dark in a closed case stays closed until
+/// it reappears.
+pub fn case_lid_from_ear(
+    old: [Option<EarDetectionStatus>; 2],
+    new: [Option<EarDetectionStatus>; 2],
+    previous: Option<LidState>,
+) -> Option<LidState> {
+    use EarDetectionStatus::{Disconnected, InCase};
+    let went_dark_in_case = old
+        .iter()
+        .zip(&new)
+        .any(|(o, n)| *o == Some(InCase) && *n == Some(Disconnected));
+    if went_dark_in_case {
+        return Some(LidState::Closed);
+    }
+    if new.contains(&Some(InCase)) {
+        return Some(LidState::Open);
+    }
+    if previous == Some(LidState::Closed) && new.contains(&Some(Disconnected)) {
+        return Some(LidState::Closed);
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AirPodsLEKeys {
     pub irk: String,
     pub enc_key: String,
@@ -240,17 +285,34 @@ pub struct AACPManagerState {
     pub connected_devices: Vec<ConnectedDevice>,
     pub ear_detection_left: Option<EarDetectionStatus>,
     pub ear_detection_right: Option<EarDetectionStatus>,
+    case_lid: Option<LidState>,
     pub primary_pod: Option<BatteryComponent>,
     event_tx: Option<mpsc::UnboundedSender<AACPEvent>>,
     pub devices: HashMap<String, DeviceData>,
+    /// Where `devices` is persisted (devices.json).
+    store_path: std::path::PathBuf,
     pub airpods_mac: Option<Address>,
     /// Broadcasts the opcode of every incoming packet for strict init sequencing.
     pub opcode_tx: tokio::sync::broadcast::Sender<u8>,
 }
 
 impl AACPManagerState {
+    /// This session's entry in the device store, created on first use: a
+    /// pair connecting for the first time has none yet.
+    fn device_entry(&mut self) -> Option<&mut DeviceData> {
+        let mac = self.airpods_mac?.to_string();
+        Some(self.devices.entry(mac.clone()).or_insert(DeviceData {
+            name: mac,
+            type_: DeviceType::AirPods,
+            information: None,
+            volume_swipe: None,
+            single_pod: None,
+        }))
+    }
+
     fn new() -> Self {
-        let devices: HashMap<String, DeviceData> = std::fs::read_to_string(get_devices_path())
+        let store_path = get_devices_path();
+        let devices: HashMap<String, DeviceData> = std::fs::read_to_string(&store_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -261,9 +323,11 @@ impl AACPManagerState {
             connected_devices: Vec::new(),
             ear_detection_left: None,
             ear_detection_right: None,
+            case_lid: None,
             primary_pod: None,
             event_tx: None,
             devices,
+            store_path,
             airpods_mac: None,
             opcode_tx: tokio::sync::broadcast::channel(16).0,
         }
@@ -574,12 +638,32 @@ impl AACPManager {
                 let ss = parse_status(secondary_status);
 
                 let mut state = self.state.lock().await;
-                let right_is_primary = state.primary_pod == Some(BatteryComponent::Right);
-                let (left, right) = if right_is_primary {
+                let mut right_is_primary = state.primary_pod == Some(BatteryComponent::Right);
+                let (mut left, mut right) = if right_is_primary {
                     (ss, ps) // index 0 = right, index 1 = left
                 } else {
                     (ps, ss) // index 0 = left, index 1 = right
                 };
+                // The pods are listed primary first, and the primary changes
+                // when one goes into the case. The packet in the new order can
+                // arrive before the battery report naming the new primary:
+                // captured as the two pods seemingly trading places, left
+                // InEar/right InCase read as left InCase/right InEar. Both
+                // pods moving in opposite directions at the same instant does
+                // not happen, so read that as the primary switching.
+                if let (Some(old_left), Some(old_right)) =
+                    (state.ear_detection_left, state.ear_detection_right)
+                    && old_left != old_right
+                    && (left, right) == (old_right, old_left)
+                {
+                    right_is_primary = !right_is_primary;
+                    state.primary_pod = Some(if right_is_primary {
+                        BatteryComponent::Right
+                    } else {
+                        BatteryComponent::Left
+                    });
+                    (left, right) = (right, left);
+                }
 
                 info!(
                     "Ear Detection: raw=[{:#04x},{:#04x}] right_is_primary={} → L={:?} R={:?}",
@@ -591,6 +675,14 @@ impl AACPManager {
                 state.ear_detection_left = Some(left);
                 state.ear_detection_right = Some(right);
 
+                let lid = case_lid_from_ear(
+                    [old_left, old_right],
+                    [Some(left), Some(right)],
+                    state.case_lid,
+                );
+                let lid_changed = lid != state.case_lid;
+                state.case_lid = lid;
+
                 if let Some(ref tx) = state.event_tx {
                     let _ = tx.send(AACPEvent::EarDetection {
                         old_left,
@@ -598,6 +690,9 @@ impl AACPManager {
                         new_left: Some(left),
                         new_right: Some(right),
                     });
+                    if lid_changed {
+                        let _ = tx.send(AACPEvent::CaseLid(lid));
+                    }
                 }
             }
             opcodes::CONVERSATION_AWARENESS => {
@@ -661,14 +756,19 @@ impl AACPManager {
                         enc_key: "".to_string(),
                     },
                 };
+                let mut info = info;
                 let mut state = self.state.lock().await;
-                if let Some(mac) = state.airpods_mac
-                    && let Some(device_data) = state.devices.get_mut(&mac.to_string())
-                {
+                if let Some(device_data) = state.device_entry() {
+                    // This packet carries no keys; they arrive in a separate
+                    // response afterwards. Keep the stored ones so the file
+                    // never loses them, even if that response never comes.
+                    if let Some(DeviceInformation::AirPods(old)) = &device_data.information {
+                        info.le_keys = old.le_keys.clone();
+                    }
                     device_data.name = info.name.clone();
                     device_data.information = Some(DeviceInformation::AirPods(info.clone()));
                 }
-                save_devices(&state.devices).await;
+                persist_device(&state).await;
                 info!("Received Information: {:?}", info);
                 if let Some(tx) = &state.event_tx {
                     let _ = tx.send(AACPEvent::DeviceInfo(Box::new(info)));
@@ -709,44 +809,32 @@ impl AACPManager {
                     keys.push((key_type, key_data));
                     offset += key_length;
                 }
+                // Types and lengths only: the keys let anyone track these
+                // buds and read their broadcasts, so they stay out of logs.
                 info!(
                     "Received Proximity Keys Response: {:?}",
                     keys.iter()
-                        .map(|(kt, kd)| (kt, hex::encode(kd)))
+                        .map(|(kt, kd)| (kt, kd.len()))
                         .collect::<Vec<_>>()
                 );
                 let mut state = self.state.lock().await;
-                for (key_type, key_data) in &keys {
-                    if let Ok(kt) = ProximityKeyType::try_from(*key_type)
-                        && let Some(mac) = state.airpods_mac
-                    {
-                        let mac_str = mac.to_string();
-                        let device_data =
-                            state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                                name: mac_str.clone(),
-                                type_: DeviceType::AirPods,
-                                information: None,
-                                volume_swipe: None,
-                            });
-                        match kt {
-                            ProximityKeyType::Irk => {
-                                if let Some(DeviceInformation::AirPods(info)) =
-                                    device_data.information.as_mut()
-                                {
-                                    info.le_keys.irk = hex::encode(key_data);
-                                }
+                if let Some(device_data) = state.device_entry() {
+                    // Keys can only be stored inside the information block;
+                    // create it if the Information packet has not come yet.
+                    let DeviceInformation::AirPods(info) = device_data
+                        .information
+                        .get_or_insert_with(|| DeviceInformation::AirPods(Default::default()));
+                    for (key_type, key_data) in &keys {
+                        match ProximityKeyType::try_from(*key_type) {
+                            Ok(ProximityKeyType::Irk) => info.le_keys.irk = hex::encode(key_data),
+                            Ok(ProximityKeyType::EncKey) => {
+                                info.le_keys.enc_key = hex::encode(key_data)
                             }
-                            ProximityKeyType::EncKey => {
-                                if let Some(DeviceInformation::AirPods(info)) =
-                                    device_data.information.as_mut()
-                                {
-                                    info.le_keys.enc_key = hex::encode(key_data);
-                                }
-                            }
+                            Err(()) => {}
                         }
                     }
                 }
-                save_devices(&state.devices).await;
+                persist_device(&state).await;
             }
             opcodes::STEM_PRESS => {
                 let press_type = payload.get(2).and_then(|&b| match b {
@@ -790,15 +878,18 @@ impl AACPManager {
                 }
             }
             opcodes::CONNECTED_DEVICES => {
-                if payload.len() < 3 {
+                // opcode(2) 01 xx count, then per device: mac(6) info1 info2.
+                // Captured: 2e00 010001 <mac> 0202 with one host, and
+                // 2e00 010202 <mac> 0202 <mac> 0214 once an iPhone joins.
+                if payload.len() < 5 {
                     error!(
                         "Connected Devices packet too short: {}",
                         hex::encode(payload)
                     );
                     return;
                 }
-                let count = payload[2] as usize;
-                if payload.len() < 3 + count * 8 {
+                let count = payload[4] as usize;
+                if payload.len() < 5 + count * 8 {
                     error!(
                         "Connected Devices packet length mismatch: {}",
                         hex::encode(payload)
@@ -830,7 +921,9 @@ impl AACPManager {
             }
             0x11 => {
                 // Smart-Routing response - only the OwnershipToFalse notification matters.
-                let packet_string = String::from_utf8_lossy(&payload[2..]);
+                // A bare opcode is legal framing; release builds abort on a
+                // slice panic, so never index past what arrived.
+                let packet_string = String::from_utf8_lossy(payload.get(2..).unwrap_or_default());
                 if packet_string.contains("SetOwnershipToFalse") {
                     info!("Received OwnershipToFalse request via smart-routing response");
                     if let Some(ref tx) = self.state.lock().await.event_tx {
@@ -908,6 +1001,28 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
+    /// Whether this device is set to be used one pod at a time.
+    pub async fn single_pod(&self) -> bool {
+        let state = self.state.lock().await;
+        state
+            .airpods_mac
+            .and_then(|mac| state.devices.get(&mac.to_string()))
+            .and_then(|d| d.single_pod)
+            .unwrap_or(false)
+    }
+
+    /// Remember the one-pod setting for this device and report it.
+    pub async fn set_single_pod(&self, on: bool) {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(device_data) = state.device_entry() {
+                device_data.single_pod = Some(on);
+                persist_device(&state).await;
+            }
+        }
+        self.emit_event(AACPEvent::SinglePod(on)).await;
+    }
+
     pub async fn send_control_command(
         &self,
         identifier: ControlCommandIdentifiers,
@@ -917,16 +1032,9 @@ impl AACPManager {
         // (toggles use 0x01 = on, 0x02 = off on the wire).
         if identifier == ControlCommandIdentifiers::VolumeSwipeMode {
             let mut state = self.state.lock().await;
-            if let Some(mac) = state.airpods_mac {
-                let mac_str = mac.to_string();
-                let device_data = state.devices.entry(mac_str.clone()).or_insert(DeviceData {
-                    name: mac_str,
-                    type_: DeviceType::AirPods,
-                    information: None,
-                    volume_swipe: None,
-                });
+            if let Some(device_data) = state.device_entry() {
                 device_data.volume_swipe = Some(value.first() == Some(&0x01));
-                save_devices(&state.devices).await;
+                persist_device(&state).await;
             }
         }
 
@@ -939,6 +1047,40 @@ impl AACPManager {
         self.send_data_packet(&packet).await
     }
 
+    /// Tell the Apple device at `target_mac`, through the AirPods, whether this
+    /// host is streaming audio: the smart-routing message Apple hosts send one
+    /// another so the one in use keeps the AirPods.
+    pub async fn send_media_information(
+        &self,
+        self_mac: &str,
+        self_name: &str,
+        target_mac: &str,
+        streaming: bool,
+    ) -> Result<()> {
+        let Some(packet) = media_information_packet(self_mac, self_name, target_mac, streaming)
+        else {
+            error!("Invalid MAC address for media information: {}", target_mac);
+            return Ok(());
+        };
+        self.send_data_packet(&packet).await
+    }
+
+    /// Tell the Apple device at `target_mac` how long the user has been idle
+    /// on this host.
+    pub async fn send_activity(
+        &self,
+        self_mac: &str,
+        self_name: &str,
+        target_mac: &str,
+        idle_secs: u16,
+    ) -> Result<()> {
+        let Some(packet) = activity_packet(self_mac, self_name, target_mac, idle_secs) else {
+            error!("Invalid MAC address for activity: {}", target_mac);
+            return Ok(());
+        };
+        self.send_data_packet(&packet).await
+    }
+
     /// Request the current SSL (audio-routing) state from the device.
     pub async fn send_ssl_request(&self) -> Result<()> {
         self.send_data_packet(&[0x29, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
@@ -946,20 +1088,166 @@ impl AACPManager {
     }
 }
 
-/// Persist the device store (names, LE keys, remembered settings) to devices.json.
-async fn save_devices(devices: &HashMap<String, DeviceData>) {
-    let Ok(json) = serde_json::to_string(devices) else {
+/// OPACK, the encoding of smart-routing payloads: a dictionary of short
+/// strings and integers is all these messages need.
+enum Opack<'a> {
+    Str(&'a str),
+    Int(u16),
+    True,
+}
+
+fn opack_str(out: &mut Vec<u8>, s: &str) {
+    // Strings up to 32 bytes carry their length in the tag.
+    debug_assert!(s.len() <= 0x20);
+    out.push(0x40 + s.len() as u8);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn opack_dict(entries: &[(&str, Opack)]) -> Vec<u8> {
+    let mut out = vec![0xE0 + entries.len() as u8];
+    for (key, value) in entries {
+        opack_str(&mut out, key);
+        match value {
+            Opack::Str(s) => opack_str(&mut out, s),
+            Opack::True => out.push(0x01),
+            Opack::Int(n) if *n <= 0xFF => out.extend_from_slice(&[0x30, *n as u8]),
+            Opack::Int(n) => {
+                out.push(0x31);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Smart-routing packet: target address (reversed), length of the rest,
+/// then a version byte and the OPACK body.
+fn smart_routing_packet(target_mac: &str, body: &[u8]) -> Option<Vec<u8>> {
+    let mut target = [0u8; 6];
+    let mut parts = target_mac.split(':');
+    for byte in &mut target {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    target.reverse();
+    let rest_len = u16::try_from(1 + body.len()).ok()?;
+    let mut packet = vec![opcodes::SMART_ROUTING, 0x00];
+    packet.extend_from_slice(&target);
+    packet.extend_from_slice(&rest_len.to_le_bytes());
+    packet.push(0x01);
+    packet.extend_from_slice(body);
+    Some(packet)
+}
+
+/// Keys and value shapes mirror what an iPhone sent this host in reply:
+/// `{playingApp, hostStreamingState, btAddress, btName,
+/// otherDeviceAudioCategory}`.
+fn media_information_packet(
+    self_mac: &str,
+    self_name: &str,
+    target_mac: &str,
+    streaming: bool,
+) -> Option<Vec<u8>> {
+    let body = opack_dict(&[
+        ("playingApp", Opack::Str("Unknown")),
+        (
+            "hostStreamingState",
+            Opack::Str(if streaming { "YES" } else { "NO" }),
+        ),
+        ("btAddress", Opack::Str(self_mac)),
+        ("btName", Opack::Str(self_name)),
+        (
+            "otherDeviceAudioCategory",
+            Opack::Int(if streaming { 301 } else { 100 }),
+        ),
+    ]);
+    smart_routing_packet(target_mac, &body)
+}
+
+/// How recently the user was active on this host, in seconds: the iPhone
+/// sends `{idleTime, newTipi, btAddress, btName, nearbyAudioScore}` with its
+/// own, and the host in use is the one with the least idle time.
+fn activity_packet(
+    self_mac: &str,
+    self_name: &str,
+    target_mac: &str,
+    idle_secs: u16,
+) -> Option<Vec<u8>> {
+    let body = opack_dict(&[
+        ("idleTime", Opack::Int(idle_secs)),
+        ("newTipi", Opack::True),
+        ("btAddress", Opack::Str(self_mac)),
+        ("btName", Opack::Str(self_name)),
+        ("nearbyAudioScore", Opack::Int(1)),
+    ]);
+    smart_routing_packet(target_mac, &body)
+}
+
+/// Serializes read-modify-write cycles on devices.json within the process.
+static DEVICES_FILE: Mutex<()> = Mutex::const_new(());
+
+/// Persist this session's entry of the device store (name, LE keys,
+/// remembered settings) to devices.json.
+async fn persist_device(state: &AACPManagerState) {
+    let Some(mac) = state.airpods_mac.map(|m| m.to_string()) else {
+        return;
+    };
+    if let Some(data) = state.devices.get(&mac) {
+        save_device_entry(&state.store_path, &mac, data).await;
+    }
+}
+
+/// Merge one device's entry into the store on disk.
+///
+/// Each session holds a copy of the store taken when it started, so writing
+/// that whole copy back would undo whatever another session saved since. Only
+/// this device's entry is replaced, and the file is swapped in by rename, so
+/// a reader (the BLE monitor, a starting session) never sees it half-written
+/// and a crash mid-save cannot truncate it.
+async fn save_device_entry(path: &std::path::Path, mac: &str, data: &DeviceData) {
+    let _guard = DEVICES_FILE.lock().await;
+    let mut devices: HashMap<String, DeviceData> = match tokio::fs::read_to_string(path).await {
+        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+            // Keep the unreadable file for inspection instead of silently
+            // replacing everyone's names and keys with a single entry.
+            let backup = path.with_extension("json.corrupt");
+            error!(
+                "{} is unreadable ({}); moving it to {}",
+                path.display(),
+                e,
+                backup.display()
+            );
+            let _ = std::fs::rename(path, &backup);
+            HashMap::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            error!("Failed to read {}: {}", path.display(), e);
+            return;
+        }
+    };
+    devices.insert(mac.to_string(), data.clone());
+
+    let Ok(json) = serde_json::to_string(&devices) else {
         error!("Failed to serialize devices to JSON");
         return;
     };
-    if let Some(parent) = get_devices_path().parent()
-        && let Err(e) = tokio::fs::create_dir_all(&parent).await
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
         error!("Failed to create directory for devices: {}", e);
         return;
     }
-    if let Err(e) = tokio::fs::write(&get_devices_path(), json).await {
+    let tmp = path.with_extension("json.tmp");
+    let result = match tokio::fs::write(&tmp, json).await {
+        Ok(()) => tokio::fs::rename(&tmp, path).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
         error!("Failed to save devices: {}", e);
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 }
 
@@ -973,7 +1261,11 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
             }
             Ok(n) => {
                 let data = &buf[..n];
-                debug!("Received {} bytes: {}", n, hex::encode(data));
+                if data.get(4) == Some(&opcodes::PROXIMITY_KEYS_RSP) {
+                    debug!("Received {} bytes: proximity keys (redacted)", n);
+                } else {
+                    debug!("Received {} bytes: {}", n, hex::encode(data));
+                }
                 manager.receive_packet(data).await;
             }
             Err(e) => {
@@ -1418,29 +1710,15 @@ mod tests {
     #[tokio::test]
     async fn connected_devices_parses_count_and_macs() {
         let (m, mut rx) = manager_with_events().await;
-        // opcode pad count [pad pad mac6 info1 info2]*count - base offset for first device is 5 (i=0 → base=5)
-        let payload = [
-            opcodes::CONNECTED_DEVICES,
-            0x00,
-            0x01,
-            0x00,
-            0x00, // padding so device entry starts at index 5
-            0xAA,
-            0xBB,
-            0xCC,
-            0xDD,
-            0xEE,
-            0xFF, // MAC
-            0x42,
-            0x43, // info1, info2
-        ];
+        // Captured from AirPods Pro 3 connected to this host and an iPhone.
+        let payload = hex::decode("2e00010202dc214853717b02022037a5f26da40214").unwrap();
         m.receive_packet(&pkt(&payload)).await;
         match next_event(&mut rx).await.expect("event") {
             AACPEvent::ConnectedDevices(_old, new) => {
-                assert_eq!(new.len(), 1);
-                assert_eq!(new[0].mac, "AA:BB:CC:DD:EE:FF");
-                assert_eq!(new[0].info1, 0x42);
-                assert_eq!(new[0].info2, 0x43);
+                assert_eq!(new.len(), 2);
+                assert_eq!(new[0].mac, "DC:21:48:53:71:7B");
+                assert_eq!(new[1].mac, "20:37:A5:F2:6D:A4");
+                assert_eq!((new[1].info1, new[1].info2), (0x02, 0x14));
             }
             _ => panic!(),
         }
@@ -1449,7 +1727,8 @@ mod tests {
     #[tokio::test]
     async fn connected_devices_truncated_packet_emits_nothing() {
         let (m, mut rx) = manager_with_events().await;
-        let payload = [opcodes::CONNECTED_DEVICES, 0x00, 0x02, 0x00, 0x00, 0xAA];
+        // Claims two devices but carries half of one.
+        let payload = [opcodes::CONNECTED_DEVICES, 0x00, 0x01, 0x02, 0x02, 0xAA];
         m.receive_packet(&pkt(&payload)).await;
         assert!(next_event(&mut rx).await.is_none());
     }
@@ -1580,5 +1859,291 @@ mod tests {
             assert_eq!(expected as u8, byte);
         }
         assert!(ControlCommandIdentifiers::try_from(0xFEu8).is_err());
+    }
+
+    fn scratch_store(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("airpods-tui-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("devices.json")
+    }
+
+    fn entry(name: &str, irk: &str) -> DeviceData {
+        DeviceData {
+            name: name.into(),
+            type_: DeviceType::AirPods,
+            information: Some(DeviceInformation::AirPods(AirPodsInformation {
+                le_keys: AirPodsLEKeys {
+                    irk: irk.into(),
+                    enc_key: String::new(),
+                },
+                ..Default::default()
+            })),
+            volume_swipe: None,
+            single_pod: None,
+        }
+    }
+
+    fn read_store(path: &std::path::Path) -> HashMap<String, DeviceData> {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Two sessions saving at once each replace only their own entry.
+    #[tokio::test]
+    async fn concurrent_saves_keep_every_device() {
+        let path = scratch_store("concurrent");
+        let a = entry("A", "aa");
+        let b = entry("B", "bb");
+        tokio::join!(
+            save_device_entry(&path, "AA:AA:AA:AA:AA:AA", &a),
+            save_device_entry(&path, "BB:BB:BB:BB:BB:BB", &b),
+        );
+        let store = read_store(&path);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store["AA:AA:AA:AA:AA:AA"].name, "A");
+        assert_eq!(store["BB:BB:BB:BB:BB:BB"].name, "B");
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_is_backed_up_not_silently_replaced() {
+        let path = scratch_store("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ truncated").unwrap();
+        save_device_entry(&path, "AA:AA:AA:AA:AA:AA", &entry("A", "aa")).await;
+        assert_eq!(read_store(&path).len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.corrupt")).unwrap(),
+            "{ truncated"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The Information packet carries no keys; receiving it must not erase the
+    /// ones an earlier session stored.
+    #[tokio::test]
+    async fn device_information_keeps_stored_proximity_keys() {
+        let (m, _rx) = manager_with_events().await;
+        let mac: Address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        {
+            let mut state = m.state.lock().await;
+            state.devices = HashMap::from([(mac.to_string(), entry("Old", "stored-irk"))]);
+        }
+        // Header bytes as captured from a pair of AirPods Pro 3.
+        let mut payload = vec![0x1D, 0x00, 0x02, 0xF5, 0x00, 0x04, 0x00];
+        for field in [
+            "New Name",
+            "A3063",
+            "Apple Inc.",
+            "SERIAL",
+            "1",
+            "2",
+            "3",
+            "id",
+            "L",
+            "R",
+            "v3",
+        ] {
+            payload.extend_from_slice(field.as_bytes());
+            payload.push(0);
+        }
+        let path = scratch_store("information");
+        {
+            let mut state = m.state.lock().await;
+            state.airpods_mac = Some(mac);
+            state.store_path = path.clone();
+        }
+        m.receive_packet(&pkt(&payload)).await;
+        let state = m.state.lock().await;
+        let Some(DeviceInformation::AirPods(info)) = &state.devices[&mac.to_string()].information
+        else {
+            panic!("expected AirPods information");
+        };
+        assert_eq!(info.name, "New Name");
+        assert_eq!(info.le_keys.irk, "stored-irk");
+        drop(state);
+        // And the same on disk.
+        let Some(DeviceInformation::AirPods(saved)) =
+            &read_store(&path)[&mac.to_string()].information
+        else {
+            panic!("expected saved AirPods information");
+        };
+        assert_eq!(saved.le_keys.irk, "stored-irk");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The transitions captured from AirPods Pro 3 during the case test.
+    #[test]
+    fn case_lid_follows_the_captured_sequence() {
+        use EarDetectionStatus::{Disconnected, InCase, InEar, OutOfEar};
+        let step = |old: [EarDetectionStatus; 2], new: [EarDetectionStatus; 2], prev| {
+            case_lid_from_ear(old.map(Some), new.map(Some), prev)
+        };
+        // Buds in ears: nothing to say about the lid.
+        assert_eq!(step([InEar, InEar], [InEar, InEar], None), None);
+        // Left pod into the open case.
+        let lid = step([OutOfEar, InEar], [InCase, InEar], None);
+        assert_eq!(lid, Some(LidState::Open));
+        // Lid closed on it: the pod drops off.
+        let lid = step([InCase, InEar], [Disconnected, InEar], lid);
+        assert_eq!(lid, Some(LidState::Closed));
+        // Still dark while the right pod comes out of the ear.
+        let lid = step([Disconnected, InEar], [Disconnected, OutOfEar], lid);
+        assert_eq!(lid, Some(LidState::Closed));
+        // Lid opened, right pod joins it.
+        let lid = step([Disconnected, OutOfEar], [InCase, InCase], lid);
+        assert_eq!(lid, Some(LidState::Open));
+        // Lid closed on both: the left drops first while the right's report
+        // still says InCase. The drop decides.
+        let lid = step([InCase, InCase], [Disconnected, InCase], lid);
+        assert_eq!(lid, Some(LidState::Closed));
+        // Taken out and worn: unknown again.
+        assert_eq!(step([InCase, InCase], [InEar, InEar], lid), None);
+    }
+
+    #[tokio::test]
+    async fn ear_detection_emits_case_lid_only_on_change() {
+        let (m, mut rx) = manager_with_events().await;
+        // L = InCase, R = InEar (left primary by default).
+        m.receive_packet(&pkt(&[0x06, 0x00, 0x02, 0x00])).await;
+        assert!(matches!(
+            next_event(&mut rx).await,
+            Some(AACPEvent::EarDetection { .. })
+        ));
+        assert!(matches!(
+            next_event(&mut rx).await,
+            Some(AACPEvent::CaseLid(Some(LidState::Open)))
+        ));
+        // Same state again: no second lid event.
+        m.receive_packet(&pkt(&[0x06, 0x00, 0x02, 0x00])).await;
+        assert!(matches!(
+            next_event(&mut rx).await,
+            Some(AACPEvent::EarDetection { .. })
+        ));
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    /// Captured: left in an ear, right just put in the case. The next ear
+    /// packet came in the new primary order before the battery report that
+    /// names the new primary, and read as the pods swapping sides.
+    #[tokio::test]
+    async fn a_primary_switch_does_not_swap_left_and_right() {
+        let (m, mut rx) = manager_with_events().await;
+        m.state.lock().await.primary_pod = Some(BatteryComponent::Right);
+        // Right primary: [right, left] = [InCase, InEar].
+        m.receive_packet(&pkt(&[0x06, 0x00, 0x02, 0x00])).await;
+        // Same state, now listed left first: [left, right] = [InEar, InCase].
+        m.receive_packet(&pkt(&[0x06, 0x00, 0x00, 0x02])).await;
+        let mut last = None;
+        while let Some(event) = next_event(&mut rx).await {
+            if let AACPEvent::EarDetection {
+                new_left,
+                new_right,
+                ..
+            } = event
+            {
+                last = Some((new_left, new_right));
+            }
+        }
+        assert_eq!(
+            last,
+            Some((
+                Some(EarDetectionStatus::InEar),
+                Some(EarDetectionStatus::InCase)
+            ))
+        );
+        assert_eq!(
+            m.state.lock().await.primary_pod,
+            Some(BatteryComponent::Left)
+        );
+    }
+
+    /// A pair connecting for the first time has no entry in the store yet.
+    /// Its information and proximity keys must still be saved, or the BLE
+    /// fallback never works for it.
+    #[tokio::test]
+    async fn a_first_connection_stores_information_and_keys() {
+        let (m, _rx) = manager_with_events().await;
+        let mac: Address = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let path = scratch_store("first-connection");
+        {
+            let mut state = m.state.lock().await;
+            state.devices.clear();
+            state.airpods_mac = Some(mac);
+            state.store_path = path.clone();
+        }
+        let mut info = vec![0x1D, 0x00, 0x02, 0xF5, 0x00, 0x04, 0x00];
+        for field in [
+            "Pods",
+            "A3063",
+            "Apple Inc.",
+            "S",
+            "1",
+            "2",
+            "3",
+            "id",
+            "L",
+            "R",
+            "v3",
+        ] {
+            info.extend_from_slice(field.as_bytes());
+            info.push(0);
+        }
+        m.receive_packet(&pkt(&info)).await;
+        // Two keys of 16 bytes: type, 0, length, 0, data.
+        let mut keys = vec![0x31, 0x00, 0x02];
+        keys.extend_from_slice(&[0x01, 0x00, 0x10, 0x00]);
+        keys.extend_from_slice(&[0x11; 16]);
+        keys.extend_from_slice(&[0x04, 0x00, 0x10, 0x00]);
+        keys.extend_from_slice(&[0x22; 16]);
+        m.receive_packet(&pkt(&keys)).await;
+
+        let store = read_store(&path);
+        let Some(DeviceInformation::AirPods(saved)) = &store[&mac.to_string()].information else {
+            panic!("information was not stored");
+        };
+        assert_eq!(saved.name, "Pods");
+        assert_eq!(saved.le_keys.irk, "11".repeat(16));
+        assert_eq!(saved.le_keys.enc_key, "22".repeat(16));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_truncated_smart_routing_packet_is_ignored() {
+        let (m, mut rx) = manager_with_events().await;
+        m.receive_packet(&pkt(&[0x11])).await;
+        assert!(next_event(&mut rx).await.is_none());
+    }
+
+    /// Lengths in the tags must match what follows: the builder this
+    /// replaces marked "YES" as two bytes and left `btName` untagged.
+    #[test]
+    fn media_information_is_well_formed_opack() {
+        let packet =
+            media_information_packet("DC:21:48:53:71:7B", "omarchy", "20:37:A5:F2:6D:A4", true)
+                .unwrap();
+        assert_eq!(&packet[..2], &[opcodes::SMART_ROUTING, 0x00]);
+        assert_eq!(&packet[2..8], &[0xA4, 0x6D, 0xF2, 0xA5, 0x37, 0x20]);
+        let rest_len = u16::from_le_bytes([packet[8], packet[9]]) as usize;
+        assert_eq!(rest_len, packet.len() - 10);
+        let body = &packet[11..];
+        assert_eq!(body[0], 0xE5);
+        let find = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
+        assert!(find(b"\x52hostStreamingState\x43YES"));
+        assert!(find(b"\x46btName\x47omarchy"));
+        assert!(find(b"\x58otherDeviceAudioCategory\x31\x2d\x01"));
+    }
+
+    #[test]
+    fn activity_mirrors_the_iphones_message() {
+        let packet =
+            activity_packet("DC:21:48:53:71:7B", "omarchy", "20:37:A5:F2:6D:A4", 0).unwrap();
+        let body = &packet[11..];
+        assert_eq!(body[0], 0xE5);
+        let find = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
+        assert!(find(b"\x48idleTime\x30\x00"));
+        assert!(find(b"\x47newTipi\x01"));
+        assert!(find(b"\x50nearbyAudioScore\x30\x01"));
     }
 }

@@ -103,21 +103,96 @@ fn draw_content(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App) {
-    // Collect battery entries
-    let bat_entries: Vec<(&str, u8, BatteryStatus)> = [
-        ("Left  ", &state.battery_left),
-        ("Right ", &state.battery_right),
-        ("Case  ", &state.battery_case),
-        ("      ", &state.battery_headphone),
+/// One row of the battery box.
+struct BatteryEntry {
+    label: &'static str,
+    /// `None` for a case whose lid is known before its level is.
+    level: Option<u8>,
+    status: BatteryStatus,
+    note: Option<&'static str>,
+}
+
+/// What to say about the case next to its level: the lid while a pod sits in
+/// it (only then does anything report the lid), otherwise that the level is
+/// the last one seen, since the case reports nothing on its own.
+fn case_note(state: &AirPodsDeviceState) -> Option<&'static str> {
+    use crate::bluetooth::aacp::LidState;
+    match state.case_lid {
+        Some(LidState::Open) => Some("lid open"),
+        Some(LidState::Closed) => Some("lid closed"),
+        None if [state.ear_left, state.ear_right].contains(&Some(EarDetectionStatus::InCase)) => {
+            None
+        }
+        None => Some("last seen"),
+    }
+}
+
+fn battery_entries(state: &AirPodsDeviceState) -> Vec<BatteryEntry> {
+    let mut entries: Vec<BatteryEntry> = [
+        ("Left  ", state.battery_left, None),
+        ("Right ", state.battery_right, None),
+        ("Case  ", state.battery_case, case_note(state)),
+        ("      ", state.battery_headphone, None),
     ]
-    .iter()
-    .filter_map(|(l, b)| b.as_ref().map(|(lvl, st)| (*l, *lvl, *st)))
+    .into_iter()
+    .filter_map(|(label, battery, note)| {
+        battery.map(|(level, status)| BatteryEntry {
+            label,
+            level: Some(level),
+            status,
+            note,
+        })
+    })
     .take(3)
     .collect();
+    // The case often reports its level only after the lid has been opened
+    // once with a pod inside; the lid itself is known straight away.
+    if state.battery_case.is_none() && state.case_lid.is_some() {
+        entries.push(BatteryEntry {
+            label: "Case  ",
+            level: None,
+            status: BatteryStatus::Disconnected,
+            note: case_note(state),
+        });
+    }
+    entries
+}
 
+fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App) {
+    let bat_entries = battery_entries(state);
     let bat_count = bat_entries.len().max(1) as u16;
     let display_name = state.model.as_deref().unwrap_or(&state.name);
+    let header = name_line(
+        display_name,
+        state.connected,
+        state.ear_left,
+        state.ear_right,
+    );
+
+    // Seen only through its broadcasts: state, but nothing to control.
+    if !state.connected {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(bat_count + 2),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(header).alignment(Alignment::Center),
+            chunks[0],
+        );
+        draw_battery_box(f, chunks[1], &bat_entries);
+        f.render_widget(
+            Paragraph::new("Not connected to this computer; settings need a connection")
+                .style(Style::default().fg(DIM))
+                .alignment(Alignment::Center),
+            chunks[2],
+        );
+        return;
+    }
 
     // No noise control box for non-ANC devices; settings still apply.
     if !state.has_anc {
@@ -134,8 +209,7 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
             .split(area);
 
         f.render_widget(
-            Paragraph::new(name_line(display_name, state.ear_left, state.ear_right))
-                .alignment(Alignment::Center),
+            Paragraph::new(header.clone()).alignment(Alignment::Center),
             chunks[0],
         );
         draw_battery_box(f, chunks[1], &bat_entries);
@@ -166,8 +240,7 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
 
     // Name line
     f.render_widget(
-        Paragraph::new(name_line(display_name, state.ear_left, state.ear_right))
-            .alignment(Alignment::Center),
+        Paragraph::new(header.clone()).alignment(Alignment::Center),
         chunks[0],
     );
 
@@ -189,7 +262,7 @@ fn draw_airpods(f: &mut Frame, area: Rect, state: &AirPodsDeviceState, app: &App
     draw_settings_table(f, st_inner, &settings_items, app.section_row, st_focused);
 }
 
-fn draw_battery_box(f: &mut Frame, area: Rect, entries: &[(&str, u8, BatteryStatus)]) {
+fn draw_battery_box(f: &mut Frame, area: Rect, entries: &[BatteryEntry]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -215,8 +288,8 @@ fn draw_battery_box(f: &mut Frame, area: Rect, entries: &[(&str, u8, BatteryStat
         .constraints(constraints)
         .split(inner);
 
-    for (i, (label, level, status)) in entries.iter().enumerate() {
-        f.render_widget(bat_row(label, *level, status), rows[i]);
+    for (entry, row) in entries.iter().zip(rows.iter()) {
+        f.render_widget(bat_row(entry), *row);
     }
 }
 
@@ -290,8 +363,17 @@ fn draw_settings_table(
             };
 
             match item {
+                // A group title: no cursor, no value, and never selected.
+                SettingsItem::Header(title) => Row::new(vec![
+                    Line::from(Span::styled(
+                        format!("  {title}"),
+                        Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::raw("")),
+                ]),
                 SettingsItem::Toggle { label, value, .. } => toggle_row(label, *value),
                 SettingsItem::CycleBit { label, value, .. } => toggle_row(label, *value),
+                SettingsItem::SinglePod { label, value } => toggle_row(label, *value),
                 SettingsItem::HoldMode { label, value, .. } => {
                     let val_str = if *value == 1 { "Siri" } else { "Noise Control" };
                     Row::new(vec![
@@ -394,19 +476,27 @@ fn ear_label(s: EarDetectionStatus) -> &'static str {
 
 fn name_line(
     display_name: &str,
+    connected: bool,
     ear_left: Option<EarDetectionStatus>,
     ear_right: Option<EarDetectionStatus>,
 ) -> Line<'_> {
+    // Fixed widths: the line is centered, so any change in length would
+    // shift the whole header instead of just the word that changed.
+    let status = if connected {
+        Span::styled("● connected", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("○ nearby   ", Style::default().fg(Color::Yellow))
+    };
     let mut spans = vec![
         Span::styled(
             format!("  {} ", display_name),
             Style::default().fg(FG).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("● connected", Style::default().fg(Color::Green)),
+        status,
     ];
     if let (Some(l), Some(r)) = (ear_left, ear_right) {
         spans.push(Span::styled(
-            format!("  L:{}  R:{}", ear_label(l), ear_label(r)),
+            format!("  L:{:<4}  R:{:<4}", ear_label(l), ear_label(r)),
             Style::default().fg(DIM),
         ));
     }
@@ -433,7 +523,24 @@ fn noise_row(label: &str, focused: bool, active: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'a> {
+fn bat_row(entry: &BatteryEntry) -> Paragraph<'static> {
+    let BatteryEntry {
+        label,
+        level,
+        status,
+        note,
+    } = *entry;
+    let Some(level) = level else {
+        let mut spans = vec![
+            Span::styled(format!("  {}", label), Style::default().fg(DIM)),
+            Span::styled(format!("{}  ", "░".repeat(10)), Style::default().fg(DIM)),
+            Span::styled(" --%", Style::default().fg(DIM)),
+        ];
+        if let Some(note) = note {
+            spans.push(Span::styled(format!("  {note}"), Style::default().fg(DIM)));
+        }
+        return Paragraph::new(Line::from(spans));
+    };
     let charging = matches!(status, BatteryStatus::Charging | BatteryStatus::InUse);
     let color = if charging {
         Color::Cyan
@@ -459,6 +566,9 @@ fn bat_row<'a>(label: &'a str, level: u8, status: &BatteryStatus) -> Paragraph<'
             "  [charging]",
             Style::default().fg(Color::Cyan),
         ));
+    }
+    if let Some(note) = note {
+        spans.push(Span::styled(format!("  {note}"), Style::default().fg(DIM)));
     }
     Paragraph::new(Line::from(spans))
 }
@@ -701,6 +811,65 @@ mod tests {
                 AirPodsNoiseControlMode::Off,
             ]
         );
+    }
+
+    #[test]
+    fn case_row_says_lid_or_that_the_level_is_old() {
+        use crate::bluetooth::aacp::LidState;
+        let mut s = AirPodsDeviceState {
+            battery_case: Some((58, BatteryStatus::NotCharging)),
+            ear_left: Some(EarDetectionStatus::InEar),
+            ear_right: Some(EarDetectionStatus::InEar),
+            ..Default::default()
+        };
+        // Both worn: the case says nothing, so its level is the last seen.
+        assert_eq!(case_note(&s), Some("last seen"));
+        s.ear_left = Some(EarDetectionStatus::InCase);
+        s.case_lid = Some(LidState::Open);
+        assert_eq!(case_note(&s), Some("lid open"));
+        s.case_lid = Some(LidState::Closed);
+        let entries = battery_entries(&s);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].note, Some("lid closed"));
+    }
+
+    /// Observed: the first time a pod went in, the case reported no level,
+    /// so the lid had no row to show on.
+    #[test]
+    fn a_known_lid_gets_a_case_row_before_the_level_arrives() {
+        use crate::bluetooth::aacp::LidState;
+        let s = AirPodsDeviceState {
+            ear_left: Some(EarDetectionStatus::InCase),
+            case_lid: Some(LidState::Open),
+            ..Default::default()
+        };
+        let entries = battery_entries(&s);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, None);
+        assert_eq!(entries[0].note, Some("lid open"));
+    }
+
+    /// Only the words may change: the header keeps its width whatever the
+    /// pods report, so the centered line does not jump.
+    #[test]
+    fn header_width_does_not_depend_on_ear_state() {
+        use EarDetectionStatus::*;
+        let width = |connected, l, r| {
+            name_line("AirPods Pro 3", connected, Some(l), Some(r))
+                .spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        };
+        let reference = width(true, InEar, InEar);
+        for (l, r) in [
+            (OutOfEar, InCase),
+            (InCase, Disconnected),
+            (InEar, OutOfEar),
+        ] {
+            assert_eq!(width(true, l, r), reference);
+            assert_eq!(width(false, l, r), reference);
+        }
     }
 
     #[test]

@@ -43,14 +43,27 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
             // Remove old events for this device and re-add
             snapshot.retain(|e| match e {
                 AppEvent::DeviceConnected { mac: m, .. } => m != mac,
+                AppEvent::DeviceNearby { mac: m, .. } => m != mac,
                 AppEvent::AACPEvent(m, _) => m != mac,
                 _ => true,
             });
             snapshot.push(event.clone());
         }
+        AppEvent::DeviceNearby { mac, .. } => {
+            // A live session outranks a broadcast.
+            if snapshot
+                .iter()
+                .any(|e| matches!(e, AppEvent::DeviceConnected { mac: m, .. } if m == mac))
+            {
+                return;
+            }
+            snapshot.retain(|e| !matches!(e, AppEvent::DeviceNearby { mac: m, .. } if m == mac));
+            snapshot.push(event.clone());
+        }
         AppEvent::DeviceDisconnected(mac) => {
             snapshot.retain(|e| match e {
                 AppEvent::DeviceConnected { mac: m, .. } => m != mac,
+                AppEvent::DeviceNearby { mac: m, .. } => m != mac,
                 AppEvent::AACPEvent(m, _) => m != mac,
                 AppEvent::DeviceDisconnected(m) => m != mac,
                 _ => true,
@@ -112,6 +125,12 @@ pub fn update_snapshot(snapshot: &mut Vec<AppEvent>, event: &AppEvent) {
                 }
                 AE::EarDetection { .. } => {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::EarDetection { .. })));
+                }
+                AE::SinglePod(_) => {
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::SinglePod(_))));
+                }
+                AE::CaseLid(_) => {
+                    snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::CaseLid(_))));
                 }
                 AE::ConnectedDevices(_, _) => {
                     snapshot.retain(|e| !matches!(e, AppEvent::AACPEvent(m, ae) if m == mac && matches!(**ae, AE::ConnectedDevices(_, _))));
@@ -247,7 +266,7 @@ impl IpcServer {
                             let _ = cmd_tx.send(cmd);
                         }
                         Err(e) => {
-                            error!("Invalid IPC command: {}", e);
+                            log::debug!("Skipping IPC command this daemon does not know: {}", e);
                         }
                     }
                 }
@@ -287,8 +306,9 @@ pub async fn ipc_connect() -> std::io::Result<(
                             break;
                         }
                     }
+                    // Debug, not error: stderr would draw over the TUI.
                     Err(e) => {
-                        error!("Invalid IPC event: {}", e);
+                        log::debug!("Skipping IPC event this version does not know: {}", e);
                     }
                 },
                 Err(_) => {
@@ -444,6 +464,39 @@ mod tests {
             },
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn snapshot_keeps_nearby_devices_until_a_session_or_disconnect() {
+        let mut snap = Vec::new();
+        let nearby = AppEvent::DeviceNearby {
+            mac: MAC_A.into(),
+            name: "Pods".into(),
+            product_id: 0x2027,
+        };
+        update_snapshot(&mut snap, &nearby);
+        update_snapshot(&mut snap, &nearby);
+        assert_eq!(snap.len(), 1);
+        update_snapshot(
+            &mut snap,
+            &AppEvent::DeviceConnected {
+                mac: MAC_A.into(),
+                name: "Pods".into(),
+                product_id: 0x2027,
+            },
+        );
+        assert!(
+            !snap
+                .iter()
+                .any(|e| matches!(e, AppEvent::DeviceNearby { .. }))
+        );
+        // A broadcast does not reintroduce a connected device as nearby.
+        update_snapshot(&mut snap, &nearby);
+        assert!(
+            !snap
+                .iter()
+                .any(|e| matches!(e, AppEvent::DeviceNearby { .. }))
+        );
     }
 
     #[test]

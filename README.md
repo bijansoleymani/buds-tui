@@ -6,26 +6,35 @@ A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy
 
 ## Features
 
-- **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications at 20% and 10% (via the daemon). The case reports its level whenever a pod sits inside; the last known value is retained while you wear both pods
-- **Noise control**: Off, Transparency, Adaptive, Noise Cancellation (model-aware, Adaptive only shown on capable devices)
-- **Settings panel**, dynamically built per model:
-  - Conversation Awareness (Pro 2, Pro 3, Pro USB-C, 4 ANC, Max 2)
-  - Adaptive Noise Level slider (adaptive-capable models)
-  - NC with One AirPod (any ANC-capable model)
-  - Volume Swipe + Volume Swipe Length, Press Speed, Press & Hold (stem-equipped models)
-  - Press-and-hold action per bud: Noise Control or Siri
-  - Hold Cycle membership (which of Off / NC / Transparency / Adaptive the press-and-hold cycles through)
-  - Crown Direction (AirPods Max)
-  - Personalized Volume, Tone Volume, In-Case Tone + In-Case Tone Volume
-  - Mic Mode (Automatic / Always Right / Always Left)
-  - Siri Voice Trigger
-  - Auto Ear Detection, Sleep Detection, Auto Connect
+- **Battery** per pod, case, and headphone (Max), with color indicators and low-battery desktop notifications at 20% and 10% (via the daemon). The case reports its level whenever a pod sits inside; the last known value is retained (marked "last seen") while you wear both pods
+- **Case lid** open/closed next to the case level whenever a pod sits in the case, both while connected and from the proximity broadcasts afterwards
+- **Noise control**: Transparency, Adaptive, Noise Cancellation and Off (model-aware; Adaptive
+  only on capable devices, Off only while Off Listening Mode is on). Number keys pick the mode
+  by its row, so the digits always match what is drawn
+- **Settings panel**, dynamically built per model and grouped the way Apple's own
+  AirPods settings are, so a row is findable by whatever it is called on the phone:
+  - *Audio & Routing*: Conversation Awareness (Pro 2, Pro 3, Pro USB-C, 4 ANC, Max 2),
+    Adaptive Noise Level slider (adaptive-capable models), Off Listening Mode,
+    Personalized Volume, Microphone (Automatic / Always Right / Always Left AirPod),
+    Automatic Ear Detection, Pause Media When Falling Asleep, Connect to This Computer,
+    Tone Volume, Enable Charging Case Sounds + Charging Case Sound Volume
+  - *Controls & Gestures*: Volume Swipe + Volume Swipe Length, Press Speed, Press & Hold
+    (stem-equipped models), press-and-hold action per bud (Noise Control or Siri),
+    Hold Cycle membership (which of Off / NC / Transparency / Adaptive the press-and-hold
+    cycles through), Crown Direction (AirPods Max), Siri Voice Trigger
+  - *Accessibility*: Use One AirPod, Noise Cancellation with One AirPod (any ANC-capable model)
+- **Use One AirPod**: a daemon setting, remembered per device. With it on, playback keeps going
+  while one bud is in and the other sits in the case; only the last bud out pauses
 - **Ear detection** status in the header
+- **Autoconnect**: pressing play here while wearing the AirPods connects them to this machine.
+  If they were playing here when they went into the case and the connection drops, the daemon
+  reconnects as they come out and claims them
 - **Stem press media controls** (play/pause, next/prev) wired through MPRIS
 - **Device renaming**: sets both the AACP name and the BlueZ alias
 - **Volume swipe synced** to system volume via configurable commands; your Volume Swipe on/off choice is remembered per device and re-applied on connect
 - **Auto audio rerouting** to the AirPods sink when playback starts or the buds go in your ears
-- **Automatic iPhone ↔ Linux handoff**: pauses local media when an Apple device takes audio ownership and reclaims the audio session once the peer stops playing (playback stays paused until you press play)
+- **Automatic iPhone ↔ Linux handoff**: pauses local media when an Apple device takes audio ownership and reclaims the audio session once the peer stops playing (playback stays paused until you press play). Pressing play here takes the AirPods back from the iPhone
+- **Battery and in-ear state without a connection**, decoded from Apple's BLE proximity advertisements: the daemon keeps reporting while the buds sit in the case or belong to your iPhone, where the control channel has nothing to say. Battery comes back per-percent rather than in 10% steps
 - **Waybar integration** via JSON output (`--waybar` / `--waybar-watch`)
 - **Background daemon** with Unix-socket IPC so the TUI launches instantly
 - **28 Apple/Beats models** with per-model capability detection; unknown Apple devices fall back to safe defaults
@@ -49,6 +58,19 @@ Both packages run an install hook that:
 The DeviceID makes BlueZ identify itself as an Apple host. Without it, AirPods still pair and play audio (A2DP works fine), but they refuse to open the AACP control channel, which is what every feature in this tool runs over. So plain music playback works without it, but battery, noise mode, settings, ear detection, etc. all stay blank.
 
 ### From source
+
+Needs Rust 1.89 or newer. If your distribution ships an older `rustc` (Debian 13
+has 1.85), install a current toolchain with [rustup](https://rustup.rs) instead of
+pinning dependencies back.
+
+Build dependencies:
+
+```bash
+# Arch
+sudo pacman -S --needed rust libpulse dbus pkgconf
+# Debian / Ubuntu
+sudo apt install pkg-config libpulse-dev libdbus-1-dev
+```
 
 ```bash
 git clone https://github.com/annoyedmilk/airpods-tui.git
@@ -128,6 +150,8 @@ Add `"custom/airpods"` to your bar's `modules-right` (or wherever you prefer) an
 omarchy restart waybar
 ```
 
+The module's `class` is `connected` while the daemon holds a session, and `nearby` when the AirPods are only seen through their broadcasts (in the case, or in use by your phone), so you can style the two apart. The tooltip includes the case lid while it is known.
+
 For scripts that don't want to parse JSON, every battery update is also written to `$XDG_RUNTIME_DIR/airpods-battery.env` as `LEFT=`/`RIGHT=`/`CASE=`/`HEADPHONE=` lines.
 
 ## Usage
@@ -171,11 +195,58 @@ volume_set_command = ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "{}"]
 # ({} is replaced with "Left battery: 18%" etc.)
 battery_alert_command = ["notify-send", "AirPods", "{}"]
 
-# Optional: run after the audio sink switches if you hit quality issues
+# Optional: restart the audio server when the AirPods' card shows up without
+# an A2DP profile. Off by default.
 # restart_audio_server = ["systemctl", "--user", "restart", "wireplumber"]
+
+# Optional: card profile used for playback. Unset, the daemon picks the
+# highest-priority A2DP profile, the one WirePlumber would choose (AAC on AirPods).
+# a2dp_profile = "a2dp-sink-sbc_xq"
+
+# Watch BLE proximity advertisements for state while the control channel is down
+ble_scan = true
+
+# Connect the AirPods when you press play here while wearing them (needs ble_scan)
+auto_connect = true
 ```
 
-Set any command to `[]` to disable that integration. `restart_audio_server` defaults to `None` (disabled).
+Set any command to `[]` to disable that integration. `restart_audio_server` and
+`a2dp_profile` default to unset.
+
+### Codec
+
+When the buds go in, the daemon switches the card to A2DP and reroutes audio to it.
+Releases up to 0.3.2 forced SBC-XQ there. Measured on AirPods Pro 3 with an Intel
+AX200, SBC-XQ sent 511 kbps against 285 kbps for AAC, with every frame split across
+two HCI packets. WirePlumber remembers that choice, so it can outlive the daemon.
+Current releases move the card back to AAC on the next activation; to do it by hand:
+
+```bash
+pactl set-card-profile bluez_card.XX_XX_XX_XX_XX_XX a2dp-sink
+```
+
+Volume and battery-alert commands run asynchronously with a five-second timeout.
+Timed-out commands are terminated and logged; volume updates keep the latest pending
+target while a command is running.
+
+### BLE proximity scanning
+
+With `ble_scan = true` (the default) the daemon watches Apple's proximity
+advertisements, so battery and in-ear state stay live even when the AACP control
+channel is down: buds in the case, or currently owned by your phone.
+
+AirPods address these broadcasts with a private address that rotates every few
+minutes, so they can only be attributed to a device whose identity key we hold.
+That key arrives over AACP, which means **a device must complete one normal
+connection before its advertisements resolve**; until then the daemon logs
+`Unattributed proximity advertisement` at debug level, and no scan runs at all
+until at least one device has stored keys.
+
+The scan only runs while none of your AirPods is connected to this machine. While
+one is, AACP reports the same state with more authority, and an LE scan would
+take airtime from the audio stream. It resumes once they disconnect.
+
+Set `ble_scan = false` to skip LE scanning entirely; autoconnect relies on it.
 
 ## Dependencies
 

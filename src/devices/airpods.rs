@@ -173,7 +173,10 @@ impl AirPodsDevice {
         if let Err(e) = aacp_manager.send_set_feature_flags_packet().await {
             return Self::fail_init(&aacp_manager, "feature flags", e).await;
         }
-        let _ = Self::wait_for_opcode(&aacp_manager, Some(opcodes::SET_FEATURE_FLAGS), 500).await;
+        // Paces the init on the device's reply. Waiting for the feature-flags
+        // opcode itself never ended early: the AirPods answer with others,
+        // so every connect sat out the full timeout.
+        let _ = Self::wait_for_opcode(&aacp_manager, None, 500).await;
 
         info!("Requesting notifications");
         if let Err(e) = aacp_manager.send_notification_request().await {
@@ -208,8 +211,7 @@ impl AirPodsDevice {
                 "Sending AapInitExt for model 0x{:04x} (unlocks Adaptive ANC)",
                 product_id
             );
-            let _ =
-                Self::wait_for_opcode(&aacp_manager, Some(opcodes::SET_FEATURE_FLAGS), 500).await;
+            let _ = Self::wait_for_opcode(&aacp_manager, None, 500).await;
             if let Err(e) = aacp_manager.send_init_ext().await {
                 return Self::fail_init(&aacp_manager, "AapInitExt", e).await;
             }
@@ -241,6 +243,9 @@ impl AirPodsDevice {
         let aacp_manager_clone_listener = aacp_manager.clone();
         mc_listener
             .start_playback_listener(aacp_manager_clone_listener)
+            .await;
+        mc_listener
+            .claim_if_it_was_playing_here(&aacp_manager)
             .await;
         drop(mc_listener);
 
@@ -277,14 +282,24 @@ impl AirPodsDevice {
                             "Received EarDetection event: old=({:?},{:?}), new=({:?},{:?})",
                             old_left, old_right, new_left, new_right
                         );
-                        let controller = mc_clone.lock().await;
-                        controller
-                            .handle_ear_detection(old_left, old_right, new_left, new_right)
-                            .await;
+                        // To the UI first: handling below can take seconds
+                        // (A2DP activation polls for the card and sink).
                         let _ = app_tx_events.send(AppEvent::AACPEvent(
                             mac_address.to_string(),
                             Box::new(event_clone),
                         ));
+                        let single_pod = aacp_manager_clone_events.single_pod().await;
+                        let controller = mc_clone.lock().await;
+                        controller
+                            .handle_ear_detection(
+                                old_left,
+                                old_right,
+                                new_left,
+                                new_right,
+                                single_pod,
+                                &aacp_manager_clone_events,
+                            )
+                            .await;
                     }
                     AACPEvent::ConversationalAwareness(status) => {
                         debug!("Received ConversationalAwareness event: {}", status);
@@ -365,6 +380,13 @@ impl AirPodsDevice {
             }
         });
 
+        // Tell the UI the remembered one-pod setting; it lives here, not on
+        // the AirPods, so nothing else would report it.
+        let single_pod = aacp_manager.single_pod().await;
+        aacp_manager
+            .emit_event(AACPEvent::SinglePod(single_pod))
+            .await;
+
         // media_controller and mac_address are used by spawned tasks above
         // but not needed in the struct after initialization
         drop(media_controller);
@@ -408,7 +430,7 @@ impl AirPodsDevice {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AirPodsInformation {
     pub name: String,
     pub model_number: String,
