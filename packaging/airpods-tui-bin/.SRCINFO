@@ -1,6 +1,6 @@
 pkgbase = airpods-tui-bin
 	pkgdesc = Terminal UI for managing AirPods on Linux over Bluetooth AACP (prebuilt binary)
-	pkgver = 0.3.2
+	pkgver = 0.3.3
 	pkgrel = 1
 	url = https://github.com/annoyedmilk/airpods-tui
 	install = airpods-tui.install
@@ -15,7 +15,7 @@ pkgbase = airpods-tui-bin
 	provides = airpods-tui
 	conflicts = airpods-tui
 	conflicts = airpods-tui-git
-	source = airpods-tui-bin-0.3.2.tar.gz::https://github.com/annoyedmilk/airpods-tui/releases/download/v0.3.2/airpods-tui-0.3.2-x86_64.tar.gz
-	sha256sums = 3954dfb147cbea7b4ae33649e56014ef28eb46cfb3911b2c52a04164097fba2f
+	source = airpods-tui-bin-0.3.3.tar.gz::https://github.com/annoyedmilk/airpods-tui/releases/download/v0.3.3/airpods-tui-0.3.3-x86_64.tar.gz
+	sha256sums = 12c7b2e5661225f0bb8e481e04df81d9a5fe717b73873ca7bfe0adade016d1ce
 
 pkgname = airpods-tui-bin
