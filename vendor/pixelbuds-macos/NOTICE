@@ -1,0 +1,82 @@
+pixelbuds-macos
+Copyright (C) 2026 Bijan Soleymani
+
+This is a vendored, modified copy of pixelbuds-tui: src/link.rs was rewritten
+to use IOBluetooth (via the btmac crate) instead of BlueZ, and src/main.rs was
+restructured for macOS's run-loop requirements. src/app.rs and src/ui.rs are
+unmodified.
+
+pixelbuds-tui is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE for the full text.
+
+Third-party code
+================
+
+src/link.rs contains code adapted from the following projects, used under
+the MIT License. Their copyright and permission notices are reproduced
+below as that license requires.
+
+- pbpctrl, https://github.com/qzed/pbpctrl
+  (Maestro RFCOMM profile connection, from cli/src/bt.rs; pbpctrl is
+  dual-licensed MIT or Apache-2.0, used here under MIT)
+
+- omarchy-pixelbuds, https://github.com/alinuxfan/omarchy-pixelbuds
+  (session, reconnect and settings handling, from
+  daemon/pixelbudsd/src/maestro_link.rs)
+
+The `maestro` crate from pbpctrl is a build dependency, not included in this
+repository, and is likewise used under MIT.
+
+--------------------------------------------------------------------------------
+pbpctrl
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2022 Maximilian Luz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+omarchy-pixelbuds
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 alinuxfan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

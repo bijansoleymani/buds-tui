@@ -1,0 +1,20 @@
+[package]
+name = "buds-macos"
+version = "0.1.0"
+edition = "2024"
+description = "AirPods and Pixel Buds in one terminal UI, on macOS"
+
+[[bin]]
+name = "buds-macos"
+path = "src/main.rs"
+
+[dependencies]
+apmac = { path = "../apmac" }
+btmac = { path = "../btmac" }
+pixelbuds-macos = { path = "../../vendor/pixelbuds-macos" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+ratatui = "0.29"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

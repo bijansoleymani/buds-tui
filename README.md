@@ -15,6 +15,47 @@ only. The Pixel Buds screen talks to the buds directly while the TUI is open.
 
 Build needs `protobuf-compiler` in addition to the dependencies below.
 
+## macOS
+
+The Pixel Buds screen runs on macOS, as a separate binary:
+
+```bash
+brew install protobuf
+cargo build --release -p pixelbuds-macos
+./target/release/pixelbuds-macos
+```
+
+The AirPods screen cannot work the way it does on Linux: AACP allows one
+session per device and macOS holds it, so a second L2CAP channel to PSM
+`0x1001` either is refused or opens inert — the AirPods never answer it.
+
+But the features are still reachable, because macOS is itself driving that
+AACP session and exposes the results. `crates/apmac` reads and writes the
+noise-control mode through undocumented CoreAudio properties, and reads
+per-bud battery from `system_profiler`:
+
+```bash
+cargo build --release -p buds-macos -p apmac
+./target/release/buds-macos          # both screens, b to switch
+./target/release/apmac status        # or just the AirPods bits, from a script
+./target/release/apmac set nc        # off | nc | transparency | adaptive
+```
+
+`buds-macos` puts both screens in one UI with `b` to switch, as on Linux, and
+brings the Pixel Buds screen to the front when the buds connect. The Maestro
+session resets on its own fairly often, so that only happens on a real
+connection — a mid-session reconnect will not pull you off the AirPods screen.
+
+Noise control needs the AirPods to be the active sound output; battery does
+not. Writing `Off` only works if "Off Listening Mode" is enabled on the buds —
+macOS accepts the write either way, so `apmac` verifies it stuck. Conversation
+awareness, ear detection and the rest of the AACP settings have no macOS
+equivalent.
+
+`crates/btmac` is the replacement for `bluer` on macOS — RFCOMM and L2CAP over
+IOBluetooth. The Linux build is unaffected. See [docs/macos.md](docs/macos.md)
+for the measurements behind all of this, and for what was left unported.
+
 ---
 
 # airpods-tui

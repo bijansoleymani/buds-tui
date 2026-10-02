@@ -85,6 +85,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "apmac"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,6 +182,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "btmac"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tokio",
+]
+
+[[package]]
+name = "buds-macos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "apmac",
+ "btmac",
+ "clap",
+ "crossterm",
+ "futures",
+ "pixelbuds-macos",
+ "ratatui",
+ "tokio",
+]
+
+[[package]]
 name = "buds-tui"
 version = "0.3.3"
 dependencies = [
@@ -234,6 +264,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
 dependencies = [
  "cipher",
+]
+
+[[package]]
+name = "cc"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
 ]
 
 [[package]]
@@ -616,6 +656,12 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "fixedbitset"
@@ -1193,6 +1239,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pixelbuds-macos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "btmac",
+ "clap",
+ "crossterm",
+ "futures",
+ "maestro",
+ "ratatui",
+ "tokio",
+]
+
+[[package]]
 name = "pixelbuds-tui"
 version = "0.1.0"
 source = "git+https://github.com/bijansoleymani/pixelbuds-tui.git?branch=master#80bb9ac9bbcc6ab55612c48ec427376cf6e6af2c"
@@ -1493,6 +1553,12 @@ checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook"

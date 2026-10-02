@@ -1,0 +1,12 @@
+[package]
+name = "apmac"
+version = "0.1.0"
+edition = "2024"
+description = "AirPods noise control and battery on macOS, through what the OS already knows"
+
+[dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "apmac"
+path = "src/main.rs"

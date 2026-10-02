@@ -3,3 +3,9 @@
 /pkg/
 /src/airpods-tui/
 /airpods-tui/
+
+# macOS port: compiled probes and captured logs
+/macos-probe/probe
+/macos-probe/anc_probe
+/macos-probe/*.log
+/macos/test_shim

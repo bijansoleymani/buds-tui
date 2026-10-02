@@ -1,0 +1,23 @@
+[package]
+name = "pixelbuds-macos"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Terminal UI for Google Pixel Buds Pro / Pro 2 on macOS: battery, ANC, EQ and settings over the Maestro protocol"
+
+[[bin]]
+name = "pixelbuds-macos"
+path = "src/main.rs"
+
+[dependencies]
+# Maestro protocol client from pbpctrl (https://github.com/qzed/pbpctrl).
+# Pure protobuf/pwRPC over a byte stream, so it is portable as-is.
+maestro = { git = "https://github.com/qzed/pbpctrl", rev = "2620367", package = "maestro" }
+# Replaces bluer, which is BlueZ-only, with IOBluetooth-backed channels.
+btmac = { path = "../../crates/btmac" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+ratatui = "0.29"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

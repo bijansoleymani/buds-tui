@@ -1,0 +1,11 @@
+[package]
+name = "btmac"
+version = "0.1.0"
+edition = "2024"
+description = "Classic-Bluetooth RFCOMM and L2CAP channels on macOS, over IOBluetooth"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "rt", "io-util"] }
+
+[build-dependencies]
+cc = "1"
