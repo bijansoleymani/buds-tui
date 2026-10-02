@@ -1195,6 +1195,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pixelbuds-tui"
 version = "0.1.0"
+source = "git+https://github.com/bijansoleymani/pixelbuds-tui.git?branch=master#80bb9ac9bbcc6ab55612c48ec427376cf6e6af2c"
 dependencies = [
  "anyhow",
  "bluer",

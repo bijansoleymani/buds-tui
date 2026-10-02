@@ -8,7 +8,7 @@ switches between them.
 
 This is [airpods-tui](https://github.com/annoyedmilk/airpods-tui) (tracked as
 the `upstream` remote) with the Pixel Buds screen from
-[pixelbuds-tui](../pixelbuds-tui) built in. Everything below describes the
+[pixelbuds-tui](https://github.com/bijansoleymani/pixelbuds-tui) built in. Everything below describes the
 AirPods side, which is unchanged: the daemon, IPC socket, config directory,
 Waybar module and battery file are all still airpods-tui's and serve AirPods
 only. The Pixel Buds screen talks to the buds directly while the TUI is open.
