@@ -15,8 +15,8 @@ const HEADER: Color = Color::Yellow;
 const FG: Color = Color::White;
 const DIM: Color = Color::DarkGray;
 
-pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
+/// Draws into `area` only, so a host can put something above or around it.
+pub fn draw_in(f: &mut Frame, area: Rect, app: &App) {
 
     if app.device_order.is_empty() {
         let msg = Paragraph::new("No device connected.\n\nWaiting…")

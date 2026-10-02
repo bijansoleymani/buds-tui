@@ -1,3 +1,22 @@
+# buds-tui
+
+AirPods **and** Google Pixel Buds Pro / Pro 2 in one terminal UI. The screen
+follows what is connected over Bluetooth: the AirPods screen for AirPods, the
+Pixel Buds screen for Pixel Buds. With both connected, the pair that
+connected last comes to the front, a tab line appears at the top, and `b`
+switches between them.
+
+This is [airpods-tui](https://github.com/annoyedmilk/airpods-tui) (tracked as
+the `upstream` remote) with the Pixel Buds screen from
+[pixelbuds-tui](../pixelbuds-tui) built in. Everything below describes the
+AirPods side, which is unchanged: the daemon, IPC socket, config directory,
+Waybar module and battery file are all still airpods-tui's and serve AirPods
+only. The Pixel Buds screen talks to the buds directly while the TUI is open.
+
+Build needs `protobuf-compiler` in addition to the dependencies below.
+
+---
+
 # airpods-tui
 
 A terminal UI for managing AirPods on Linux, built for [Omarchy](https://omarchy.org/). Speaks Apple's AACP control channel over Bluetooth to expose battery, noise mode, conversation awareness, stem controls, and the rest of the iOS settings panel from a keyboard-driven TUI.

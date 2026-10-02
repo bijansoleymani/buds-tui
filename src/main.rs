@@ -5,6 +5,7 @@ mod handoff;
 mod ipc;
 mod media_controller;
 mod pulse_sinks;
+mod switcher;
 mod tui;
 mod utils;
 
@@ -38,7 +39,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::bluetooth::AIRPODS_AACP_UUID;
 
 #[derive(Parser)]
-#[command(name = "airpods-tui", about = "AirPods TUI controls for Linux")]
+#[command(name = "buds-tui", about = "AirPods and Pixel Buds TUI controls for Linux")]
 struct Args {
     #[arg(long, short = 'd', help = "Enable debug logging")]
     debug: bool,
@@ -195,7 +196,7 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
 
     if args.version {
-        println!("airpods-tui {}", env!("CARGO_PKG_VERSION"));
+        println!("buds-tui {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -385,19 +386,48 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(app_rx, cmd_tx);
+    let (mut pixel, mut pixel_rx) = pixelbuds_tui::spawn_link(None)?;
+    let mut switcher = switcher::Switcher::new();
 
     // Main TUI loop
     loop {
         app.process_events();
+        while let Ok(ev) = pixel_rx.try_recv() {
+            pixel.apply(ev);
+        }
+        switcher.update(switcher::airpods_connected(&app), pixel.present);
 
-        terminal.draw(|f| tui::ui::draw(f, &app))?;
+        terminal.draw(|f| {
+            let area = switcher::draw_tabs(f, &switcher);
+            match switcher.screen {
+                switcher::Screen::AirPods => tui::ui::draw_in(f, area, &app),
+                switcher::Screen::PixelBuds => pixelbuds_tui::ui::draw_in(f, area, &pixel),
+            }
+        })?;
 
         if event::poll(Duration::from_millis(50))? {
-            let ev = event::read()?;
-            tui::events::handle_event(&mut app, ev);
+            match event::read()? {
+                // The AirPods rename box takes `b` as text.
+                event::Event::Key(key)
+                    if key.code == event::KeyCode::Char('b')
+                        && key.kind == event::KeyEventKind::Press
+                        && switcher.both()
+                        && app.rename_mode.is_none() =>
+                {
+                    switcher.toggle();
+                }
+                ev => match switcher.screen {
+                    switcher::Screen::AirPods => tui::events::handle_event(&mut app, ev),
+                    switcher::Screen::PixelBuds => {
+                        if let event::Event::Key(key) = ev {
+                            pixelbuds_tui::handle_key(&mut pixel, key);
+                        }
+                    }
+                },
+            }
         }
 
-        if app.should_quit {
+        if app.should_quit || pixel.quit {
             break;
         }
     }
